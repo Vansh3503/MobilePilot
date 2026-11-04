@@ -53,7 +53,8 @@ opened: popup menu (5 items): pick one by ref, or mobile_key back to close it
 Permission and system dialogs are reported, never answered. Unlabeled icons show where they are
 (`button unlabeled, top-left  id=up`); `mobile_screenshot(annotate=true)` draws the refs on the
 image, and taps and drags accept that image's pixels (`coordinate_space="screenshot"`) when no ref
-exists. A phone that locked itself is woken; a PIN is left to the person (`NEEDS_USER`).
+exists. A phone that locked itself is woken; a PIN is left to the person (`NEEDS_USER`). If the person
+uses the phone between calls, the next action works from the screen as it really is.
 
 ## Run
 

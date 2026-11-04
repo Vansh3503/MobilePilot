@@ -230,3 +230,32 @@ def test_android_17_menu_alone_in_the_dump_is_still_a_menu_and_closing_it_is_one
     assert "elements of the screen behind it" in opened and '- button' not in opened, opened
     assert "closed: popup menu" in closed and "elements back as snapshot" in closed, closed
     assert '"Save"' not in closed and '"Share"' not in closed, closed  # one line each way
+
+
+def test_when_the_person_changes_the_screen_the_action_works_from_the_real_one(tmp_path):
+    driver, engine, _ = _driver(tmp_path)
+    first = driver.run([("mobile_snapshot", {})])[0]
+    up = _ref(_text(first), "id=up")
+    engine.current = "menu"  # the person opened the menu by hand
+    out = driver.run([("mobile_tap", {"ref": up})])
+    assert not out[0].is_error and "the screen had changed since the last result" in _text(out[0]), _text(out[0])
+    assert engine.log[-1] == "tap 24,48"
+
+    engine.screens["other"] = dump(node("FrameLayout", "[0,0][320,640]", children=node(
+        "Button", "[0,0][320,80]", text="Unrelated", clickable=True)))
+    engine.current = "other"  # then went somewhere else entirely
+    taps = len(engine.log)
+    out = driver.run([("mobile_tap", {"ref": up})])
+    text = _text(out[0])
+    assert out[0].is_error and "STALE_REF" in text and "Nothing was done" in text and '"Unrelated"' in text, text
+    assert len(engine.log) == taps  # nothing was tapped
+
+
+def test_an_unchanged_screen_costs_no_second_capture(tmp_path):
+    driver, engine, _ = _driver(tmp_path)
+    captures = []
+    real = engine.capture_tree
+    engine.capture_tree = lambda: captures.append(1) or real()
+    out = driver.run([("mobile_snapshot", {}), ("mobile_tap", lambda out: {"ref": _ref(_text(out[0]), "id=up")})])
+    assert "had changed" not in _text(out[1])
+    assert len(captures) == 3  # the snapshot, the fake's own hit test, the diff; no rebase capture

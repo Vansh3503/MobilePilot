@@ -351,6 +351,7 @@ class AndroidEngine(Engine):
 
     def capture_tree(self) -> RawTree:
         xml = self._call(self._d.dump_hierarchy)
+        self.last_fingerprint = fingerprint(xml)
         current = self._foreground()
         rotation = re.search(r'<hierarchy rotation="(\d)"', xml)
         if rotation and rotation.group(1) in "13" and self._size[0] < self._size[1]:

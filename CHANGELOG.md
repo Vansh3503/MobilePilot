@@ -5,6 +5,10 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+- If the person used the phone between calls (tapped, scrolled, switched apps), the next action
+  notices (one 0.16 s fingerprint on a Pixel 7a) and works from the real screen: a ref still on
+  it is used where it is now; a ref that is gone is refused with the current screen and the way
+  back, and nothing is tapped.
 - A tap that opens a menu, drop-down, dialog, bottom sheet or system prompt says `opened: <kind>`
   and lists all its options; closing it is one line. Android 17 dumps only the focused window, so
   a lone window smaller than the screen counts as an overlay.

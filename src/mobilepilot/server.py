@@ -241,6 +241,30 @@ class Session:
         self._last_action = time.monotonic()
         return note
 
+    def _rebase(self, engine: Engine, before: Snapshot | None, target: Element | None) -> tuple[Snapshot | None, str | None]:
+        """The person may have used the phone since the last result (a tap, a swipe, another app).
+        One fingerprint tells; then the action works from the screen as it is now: a target still
+        on it is acted on where it is now, a target that is gone is refused with the current screen,
+        so the agent can find its way back instead of tapping whatever took its place."""
+        if before is None or engine.last_fingerprint is None or engine.signature() == engine.last_fingerprint:
+            return before, None
+        fresh = self._build(engine.capture_tree(), mode=before.mode, previous=before)
+        where = ""
+        if fresh.app.name != before.app.name:
+            where = f" Now in {fresh.app.name}, not {before.app.name}: mobile_app launch or mobile_key back returns."
+        if target is not None and fresh.element(target.ref) is None:
+            raise MobilePilotError(
+                ErrorCode.STALE_REF, f"The screen changed since your last result (someone may be using the phone) and "
+                f"{target.ref} is not on it.{where} Nothing was done. The current screen:\n{format_snapshot(fresh)}",
+                hint="Get back to the step's screen, or act on a ref from this one.")
+        return fresh, "the screen had changed since the last result (someone may have used the phone): acted on it as it is now." + where
+
+    def _now(self, el: Element | None) -> Element | None:
+        """``el`` as the latest snapshot shows it (after a rebase it may have moved)."""
+        latest = self.store.latest()
+        cur = latest.element(el.ref) if el is not None and latest is not None else None
+        return cur if cur is not None and cur.frame is not None else el
+
     def _cap(self, action: str) -> float:
         return self.settle_s if self.settle_s is not None else SETTLE_S.get(action, DEFAULT_SETTLE_S)
 
@@ -333,11 +357,12 @@ class Session:
                   before: Snapshot | None, target: Element | None) -> str:
         engine = self._engine()
         woke = self._awake(engine)
+        before, moved = self._rebase(engine, before, target)
         summary = do(engine)
         self._last_action = time.monotonic()
         cap = self._cap(action)
         settled = self._settle(engine, cap)
-        lines = [summary] if woke is None else [f"({woke})", summary]
+        lines = [f"({note})" for note in (woke, moved) if note] + [summary]
         if report != "none":
             tree = engine.capture_tree()
             mode = before.mode if before is not None else "interactive"
@@ -502,6 +527,8 @@ class Session:
 
         def do(engine: Engine) -> str:
             nonlocal point
+            if el is not None:
+                point = self._now(el).center
             note = ""
             if covered and el is not None:
                 # the keyboard sits over the target: hide it, then find the element again (the
@@ -532,8 +559,9 @@ class Session:
                 hint="Type into it only with a value the developer gave you for this test, and pass secret=true.")
 
         def do(engine: Engine) -> str:
-            if target is not None and not target.focused and target.center is not None:
-                engine.tap(target.center.x, target.center.y)
+            cur = self._now(target)
+            if cur is not None and not cur.focused and cur.center is not None:
+                engine.tap(cur.center.x, cur.center.y)
                 time.sleep(self.poll_s)
             engine.type_text(text, clear=clear)
             if submit:
@@ -552,7 +580,7 @@ class Session:
             raise MobilePilotError(ErrorCode.INVALID_ARGUMENT, "distance is a fraction of the area: 0.1 to 0.9.")
         if not 0.05 <= duration_s <= 5:
             raise MobilePilotError(ErrorCode.INVALID_ARGUMENT, "duration_s must be 0.05 to 5 seconds.")
-        before = None
+        before = el = None
         if direction is None:
             if None in (from_x, from_y, to_x, to_y):
                 raise MobilePilotError(ErrorCode.INVALID_ARGUMENT, "Pass direction, or from_x/from_y/to_x/to_y.")
@@ -577,7 +605,7 @@ class Session:
             engine.swipe(*path, duration_s=duration_s)
             return f"swiped {direction or 'from ({:g},{:g}) to ({:g},{:g})'.format(*path)}" + (f" in {ref}" if ref else "")
 
-        return await self.act(do, report=report, screenshot=screenshot, action="swipe", before=before)
+        return await self.act(do, report=report, screenshot=screenshot, action="swipe", before=before, target=el)
 
     def _point(self, ref: str | None, x: float | None, y: float | None, what: str, space: str = "device",
                shot_id: str | None = None):
@@ -608,10 +636,12 @@ class Session:
             engine.drag(start.x, start.y, end.x, end.y, hold_s=hold_s, duration_s=duration_s)
             return f"dragged {start_label} to {end_label}"
 
-        return await self.act(do, report=report, screenshot=screenshot, action="drag", before=before)
+        target = self._resolve(from_ref)[1] if from_ref else None
+        return await self.act(do, report=report, screenshot=screenshot, action="drag", before=before, target=target)
 
     async def pinch(self, zoom: Literal["in", "out"], ref: str | None = None, report: Report = "diff",
                     screenshot: bool = False) -> str:
+        el = None
         if ref:
             before, el = self._on_screen(ref)
             box, label = el.frame, f" on {format_element_line(el)}"
@@ -627,7 +657,7 @@ class Session:
             engine.pinch(cx, cy, spread, zoom=zoom)
             return f"pinched to zoom {zoom}{label}"
 
-        return await self.act(do, report=report, screenshot=screenshot, action="pinch", before=before)
+        return await self.act(do, report=report, screenshot=screenshot, action="pinch", before=before, target=el)
 
     async def rotate(self, orientation: Literal["portrait", "landscape", "auto"], report: Report = "diff",
                      screenshot: bool = False) -> str:

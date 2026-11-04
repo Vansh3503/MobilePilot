@@ -32,6 +32,7 @@ class FakeEngine(Engine):
         self.typed: list[str] = []
 
     def capture_tree(self) -> RawTree:
+        self.last_fingerprint = self.signature()
         return parse_hierarchy(self.screens[self.current], package=self.package,
                                activity=self.activities.get(self.current, self.current),
                                pid=4242, size=(320, 640))

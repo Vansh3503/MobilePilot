@@ -42,6 +42,8 @@ class Engine(ABC):
     """One connected device."""
 
     platform: Platform
+    last_fingerprint: int | None = None
+    """:meth:`signature` of the screen the last :meth:`capture_tree` read (None: unknown)."""
 
     @abstractmethod
     def capture_tree(self) -> RawTree:
