@@ -183,8 +183,11 @@ class IosSimulatorEngine(Engine):
                                    hint="There is no back key on iOS: tap the navigation bar's back button.")
 
     def app(self, action: AppAction, *, app: str | None = None, path: str | None = None,
-            permission: str | None = None) -> str:
+            permission: str | None = None, url: str | None = None) -> str:
         sim = ["xcrun", "simctl"]
+        if action == "open":
+            _run([*sim, "openurl", self.udid, url or ""])
+            return f"opened {url}"
         if action == "current":
             return self._bundle or "unknown (MobilePilot only knows apps it launched)"
         if action == "install":

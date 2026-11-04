@@ -34,10 +34,26 @@ every result under 1,000 characters. Tree dumps go through uiautomator2 (51 ms) 
 
 ## Tools
 
-`mobile_devices`, `mobile_app` (launch, restart, stop, clear, install, grant, current),
-`mobile_snapshot`, `mobile_tap`, `mobile_type`, `mobile_swipe`, `mobile_key`, `mobile_find`
-(scrolls on the server), `mobile_wait_for`, `mobile_screenshot`, `mobile_locate` (graded Appium
-locators for the refs you used).
+`mobile_devices`, `mobile_app` (launch, restart, stop, clear, install, grant, current, open a deep
+link), `mobile_snapshot`, `mobile_tap` (long press, double tap), `mobile_type`, `mobile_swipe`,
+`mobile_drag`, `mobile_pinch`, `mobile_rotate`, `mobile_key` (including the notification shade),
+`mobile_find` (scrolls on the server), `mobile_wait_for`, `mobile_screenshot` (annotated with refs
+on request), `mobile_locate` (graded Appium locators for the refs you used).
+
+A tap that opens a menu, drop-down, dialog or sheet says so and lists every option with its ref:
+
+```
+tapped e3 button "More options"  aid  id=overflow_action_button  (1017,201)
+- 14 elements of the screen behind it (they return when it closes)
+opened: popup menu (5 items): pick one by ref, or mobile_key back to close it
+  e15 row "Screensaver"  (792,354)
+  …
+```
+
+Permission and system dialogs are reported, never answered. Unlabeled icons show where they are
+(`button unlabeled, top-left  id=up`); `mobile_screenshot(annotate=true)` draws the refs on the
+image, and taps and drags accept that image's pixels (`coordinate_space="screenshot"`) when no ref
+exists. A phone that locked itself is woken; a PIN is left to the person (`NEEDS_USER`).
 
 ## Run
 

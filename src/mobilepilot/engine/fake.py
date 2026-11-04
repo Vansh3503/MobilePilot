@@ -27,6 +27,8 @@ class FakeEngine(Engine):
         """Screen → activity name (default: the screen name). Screens of one activity share refs."""
         self.package = package
         self.log: list[str] = []
+        self.shot_size = (320, 640)
+        """Size of the PNG ``screenshot`` writes (smaller than the screen to test scaling)."""
         self.typed: list[str] = []
 
     def capture_tree(self) -> RawTree:
@@ -44,16 +46,17 @@ class FakeEngine(Engine):
 
     def tap(self, x: float, y: float, *, hold_s: float = 0.0) -> None:
         self.log.append(f"tap {x:g},{y:g}")
-        best, target = None, None
-        for node in self.capture_tree().root.walk():
-            f = node.frame
-            if f is None or not (f.x <= x < f.x + f.w and f.y <= y < f.y + f.h):
-                continue
+        # the innermost node under the finger, then its own labels and its children's (a row is
+        # tapped through its title text)
+        under = [n for n in self.capture_tree().root.walk()
+                 if n.frame is not None and n.frame.x <= x < n.frame.x + n.frame.w and n.frame.y <= y < n.frame.y + n.frame.h]
+        for node in sorted(under, key=lambda n: n.frame.area):
             hits = [self.taps[(self.current, label)] for label in self._labels(node) if (self.current, label) in self.taps]
-            if hits and (best is None or f.area <= best.frame.area):
-                best, target = node, hits[0]
-        if target is not None:
-            self.current = target
+            if hits:
+                self.current = hits[0]
+                return
+            if node.actions:  # a tappable element with no script: the tap is its own, nothing moves
+                return
 
     def type_text(self, text: str, *, clear: bool = False) -> None:
         self.typed.append(text)
@@ -81,8 +84,8 @@ class FakeEngine(Engine):
             self.current = self.back[self.current]
 
     def app(self, action: AppAction, *, app: str | None = None, path: str | None = None,
-            permission: str | None = None) -> str:
-        self.log.append(f"app {action} {app or path or ''}".strip())
+            permission: str | None = None, url: str | None = None) -> str:
+        self.log.append(f"app {action} {app or path or url or ''}".strip())
         if action == "clear" and not app:
             raise MobilePilotError(ErrorCode.INVALID_ARGUMENT, "clear needs app.")
         return f"{action} {app or path or ''}".strip()
@@ -91,5 +94,5 @@ class FakeEngine(Engine):
         from PIL import Image
 
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Image.new("RGB", (320, 640), "white").save(path, format="PNG")
-        return (320, 640)
+        Image.new("RGB", self.shot_size, "white").save(path, format="PNG")
+        return self.shot_size

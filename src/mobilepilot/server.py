@@ -1,4 +1,4 @@
-"""The MCP server: eleven ``mobile_*`` tools over one persistent device connection.
+"""The MCP server: fourteen ``mobile_*`` tools over one persistent device connection.
 
 Built for few model round trips per screen (``mobile_snapshot`` → act and read the diff →
 optional evidence): every action waits until the screen settles and returns what changed, rows
@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import os
+import re
 import time
 from collections import OrderedDict
 from collections.abc import Callable
@@ -38,7 +39,7 @@ except ImportError:  # mcp 1.x: Stuntman bundles MobilePilot in a backend venv p
 from mobilepilot.engine.base import KEYS, Device, Engine
 from mobilepilot.errors import ErrorCode, MobilePilotError
 from mobilepilot.models import RawNode, RawTree
-from mobilepilot.perception.diff import diff_snapshots
+from mobilepilot.perception.diff import diff_snapshots, element_changes
 from mobilepilot.perception.format import format_diff, format_element_line, format_snapshot
 from mobilepilot.perception.locators import format_locate
 from mobilepilot.perception.model import Element, Snapshot, SnapshotMode
@@ -49,8 +50,11 @@ from mobilepilot.perception.store import SnapshotStore
 T = TypeVar("T")
 Report = Literal["diff", "snapshot", "none"]
 
-SETTLE_S = 3.0
-"""How long an action waits for the screen to stop changing before reporting what it shows."""
+SETTLE_S: dict[str, float] = {"launch": 10.0, "type": 1.5, "swipe": 2.0, "drag": 2.0, "pinch": 2.0, "rotate": 4.0,
+                               "notifications": 1.5, "quick_settings": 1.5}
+"""How long each action waits for the screen to stop changing before reporting what it shows
+(anything else: :data:`DEFAULT_SETTLE_S`). A cold app start needs far longer than a keystroke."""
+DEFAULT_SETTLE_S = 3.0
 POLL_S = 0.15
 FIRST_LOOK_S = 0.5
 """Measured on the API 34 emulator: two dumps 150 ms apart can agree in the middle of a screen
@@ -59,13 +63,23 @@ shifted by 128 px; after 350 ms rows were still 4 px off. Settings' transitions 
 # ponytail: a fixed first look; a device with animations off (adb shell settings put global
 # *_animation_scale 0) would settle at once, but changing device settings is the developer's call.
 ENGINE_TIMEOUT_S = 30.0
+CALL_CEILING_S = 55.0
+"""No call may run longer: Stuntman stops an MCP call at 60 s (``MCP_CALL_SECS``)."""
+WAIT_MAX_S = 45.0
+SHOT_SIDE = 1280
+AWAKE_CHECK_S = 10.0
+"""Check the screen is on and unlocked only after this long without an action."""
 MAX_ELEMENTS = 150
 
 INSTRUCTIONS = """MobilePilot drives an Android emulator/phone or an iOS simulator through its accessibility tree.
 
 Per screen: mobile_snapshot once, then act (mobile_tap / mobile_type / mobile_swipe / mobile_key) and READ THE DIFF the action returns — it already waited for the screen to settle, so do not snapshot again to check. Pass screenshot=true on the action whose result is the step's evidence. Refs (e12) stay valid while their element is on screen.
 
-Each row shows its locators inline: aid = accessibility id (strongest), id= = Android resource-id. Call mobile_locate once at the end with the refs you used, for graded locators to put in a script. Long lists: mobile_find(text, scroll=true) scrolls on the server. Slow screens: mobile_wait_for. No device: every tool says NO_DEVICE; ask the developer to start one."""
+Each row shows its locators inline: aid = accessibility id (strongest), id= = Android resource-id. Call mobile_locate once at the end with the refs you used, for graded locators to put in a script. Long lists: mobile_find(text, scroll=true) scrolls on the server. Slow screens, spinners, toasts: mobile_wait_for. No device: every tool says NO_DEVICE; ask the developer to start one.
+
+When a tap opens a menu, drop-down, dialog or sheet, the result says "opened: <kind>" and lists every option with its ref: pick one directly. A "permission dialog" or "system dialog" is the person's decision: never answer it yourself; say what it asks and wait. NEEDS_USER (a locked phone) also needs the person.
+
+Unlabeled icons show as "button unlabeled, top-left  id=…". If you cannot tell which ref you need, or the screen has no tree (games, Flutter, canvas, thin web views), mobile_screenshot(annotate=true, show=true) draws the refs on the image; with no ref at all, tap the image's pixels with coordinate_space="screenshot" and its screenshot_id."""
 
 
 def _default_list_devices() -> list[Device]:
@@ -93,6 +107,48 @@ def _matches(node: RawNode | Element, needle: str) -> bool:
     return any(t and needle in t.casefold() for t in texts)
 
 
+_ASK_PERSON = ("Do not answer it yourself: tell the person what it asks and wait for their choice. "
+               "Their answer may be to tap one of these.")
+
+
+def _opened(before: RawTree | None, after: RawTree, snap: Snapshot,
+            target: Element | None) -> tuple[list[str], set[str], frozenset]:
+    """Lines naming windows that appeared or went away (menus, drop-downs, dialogs, sheets,
+    system prompts), each new one with ALL its controls so the model can pick one without
+    another snapshot; the refs listed that way (left out of the diff's added lines); and the handles
+    of closed windows' nodes (their rows are left out of the removed lines)."""
+    def key(o):
+        f = o.frame
+        return o.kind, o.package, (round(f.x), round(f.y), round(f.w), round(f.h)) if f is not None else None
+
+    old = {key(o) for o in before.overlays} if before is not None else set()
+    new = {key(o) for o in after.overlays}
+    lines: list[str] = []
+    shown: set[str] = set()
+    for o in after.overlays:
+        if key(o) in old:
+            continue
+        items = [el for el in snap.all_elements if el.handle in o.handles and el.interactive]
+        kind = o.kind
+        if kind == "popup menu" and target is not None and target.ax_role == "AXPopUpButton":
+            kind = "drop-down list"
+        head = f"opened: {kind} ({len(items)} item{'s' if len(items) != 1 else ''})"
+        if kind in ("permission dialog", "system dialog", "crash/ANR dialog"):
+            head += f" from {o.package}. {_ASK_PERSON}"
+        else:
+            head += ": pick one by ref, or mobile_key back to close it"
+        lines.append(head)
+        lines.extend("  " + format_element_line(el) for el in items)
+        shown.update(el.ref for el in items)
+    gone: frozenset = frozenset()
+    if before is not None:
+        for o in before.overlays:
+            if key(o) not in new:
+                lines.append(f"closed: {o.kind}")
+                gone |= o.handles
+    return lines, shown, gone
+
+
 class Session:
     """One server process: the selected device, the snapshot store and the evidence counter."""
 
@@ -102,7 +158,7 @@ class Session:
         list_devices: Callable[[], list[Device]] = _default_list_devices,
         connect: Callable[[Device], Engine] = _default_connect,
         screenshots_dir: str | Path | None = None,
-        settle_s: float = SETTLE_S,
+        settle_s: float | None = None,
         poll_s: float = POLL_S,
         first_look_s: float = FIRST_LOOK_S,
     ) -> None:
@@ -116,15 +172,22 @@ class Session:
         self.screenshots_dir = Path(screenshots_dir or os.environ.get("MOBILEPILOT_SCREENSHOTS_DIR")
                                     or Path.cwd() / "mobilepilot-screenshots")
         self.settle_s = settle_s
+        """One budget for every action (tests); None uses :data:`SETTLE_S`."""
         self.poll_s = poll_s
         self.first_look_s = first_look_s
         self.step = 0
+        self.shots: OrderedDict[str, tuple[float, str | None]] = OrderedDict()
+        """Screenshot id → (image pixels per device pixel, snapshot it was annotated from)."""
         self._lock = anyio.Lock()
+        self._last_action = float("-inf")
 
     # ------------------------------------------------------------------ plumbing
     async def run(self, fn: Callable[..., T], *args: Any, timeout_s: float = ENGINE_TIMEOUT_S, **kwargs: Any) -> T:
         """Run blocking device work in a worker thread, one call at a time, with a deadline."""
         call = functools.partial(fn, *args, **kwargs)
+        if self.engine is None:  # the first call connects, which installs uiautomator2's server
+            timeout_s = CALL_CEILING_S
+        timeout_s = min(timeout_s, CALL_CEILING_S)
         async with self._lock:
             with anyio.move_on_after(timeout_s):
                 return await anyio.to_thread.run_sync(call, abandon_on_cancel=True)
@@ -170,11 +233,22 @@ class Session:
         history = self.store.snapshots_of(snap.app.pid, window_id, limit=HISTORY_LIMIT)
         return self._keep(carry_refs(snap, previous, self.store.refs, history=history), tree)
 
-    def _settle(self, engine: Engine) -> bool:
-        """Wait until two fingerprints in a row agree (True), or give up after ``settle_s``."""
+    def _awake(self, engine: Engine) -> str | None:
+        """A phone left alone locks itself; one being driven never times out, so look only after a pause."""
+        note = None
+        if time.monotonic() - self._last_action > AWAKE_CHECK_S:
+            note = engine.ensure_awake()
+        self._last_action = time.monotonic()
+        return note
+
+    def _cap(self, action: str) -> float:
+        return self.settle_s if self.settle_s is not None else SETTLE_S.get(action, DEFAULT_SETTLE_S)
+
+    def _settle(self, engine: Engine, cap: float) -> bool:
+        """Wait until two fingerprints in a row agree (True), or give up after ``cap`` seconds."""
         time.sleep(self.first_look_s)
         prev = engine.signature()
-        deadline = time.monotonic() + self.settle_s
+        deadline = time.monotonic() + cap
         while time.monotonic() < deadline:
             time.sleep(self.poll_s)
             cur = engine.signature()
@@ -196,18 +270,45 @@ class Session:
                                    hint="Pass a file name such as \"login-error.png\", or no path.")
         return target
 
-    def _shoot(self, engine: Engine, path: Path) -> str:
-        width, height = engine.screenshot(str(path))
+    def _shoot(self, engine: Engine, path: Path, *, annotate: bool = False) -> str:
+        """Save a screenshot; name it (shot_N) with its scale so mobile_tap/mobile_drag can take
+        its pixels (coordinate_space="screenshot"). annotate draws each ref of the latest
+        snapshot on its element, so an unlabeled icon can be matched to its ref by eye."""
+        width, height = engine.screenshot(str(path), max_side=SHOT_SIDE)
+        snap = self.store.latest()
+        screen = snap.window.frame if snap is not None and snap.window is not None else None
+        scale = width / screen.w if screen is not None and screen.w else None
         note = ""
         try:
             from PIL import Image as PILImage
+            from PIL import ImageDraw
 
             with PILImage.open(path) as img:
                 if img.convert("L").getextrema()[1] < 8:
                     note = " — all black: the app marks this screen secure (FLAG_SECURE); the tree still works"
+                elif annotate and snap is not None and scale:
+                    img = img.convert("RGB")
+                    draw = ImageDraw.Draw(img)
+                    for el in snap.all_elements:
+                        if not el.interactive or el.frame is None:
+                            continue
+                        f = el.frame
+                        box = [f.x * scale, f.y * scale, (f.x + f.w) * scale, (f.y + f.h) * scale]
+                        draw.rectangle(box, outline=(255, 0, 140), width=2)
+                        tw = draw.textlength(el.ref)
+                        draw.rectangle([box[0], box[1], box[0] + tw + 6, box[1] + 13], fill=(255, 0, 140))
+                        draw.text((box[0] + 3, box[1]), el.ref, fill="white")
+                    img.save(path, format="PNG")
+                    note = f" — refs of snapshot {snap.snapshot_id} drawn on it"
         except OSError:
             pass
-        return f"screenshot {path} ({width}×{height}){note}"
+        if scale is None:
+            return f"screenshot {path} ({width}×{height}){note}"
+        shot_id = f"shot_{len(self.shots) + 1}"
+        self.shots[shot_id] = (scale, snap.snapshot_id)
+        while len(self.shots) > 32:
+            self.shots.popitem(last=False)
+        return f"screenshot {path} ({width}×{height}, id {shot_id}, {scale:.3g} image px per device px){note}"
 
     def _resolve(self, ref: str) -> tuple[Snapshot, Element]:
         return self.store.resolve(ref)
@@ -229,34 +330,82 @@ class Session:
 
     # ------------------------------------------------------------------ the action loop
     def _act_sync(self, do: Callable[[Engine], str], report: Report, screenshot: bool, action: str,
-                  before: Snapshot | None) -> str:
+                  before: Snapshot | None, target: Element | None) -> str:
         engine = self._engine()
+        woke = self._awake(engine)
         summary = do(engine)
-        settled = self._settle(engine)
-        lines = [summary]
+        self._last_action = time.monotonic()
+        cap = self._cap(action)
+        settled = self._settle(engine, cap)
+        lines = [summary] if woke is None else [f"({woke})", summary]
         if report != "none":
             tree = engine.capture_tree()
             mode = before.mode if before is not None else "interactive"
+            old_tree = self.trees.get(before.snapshot_id) if before is not None else None
             after = self._build(tree, mode=mode, previous=before)
+            opened, shown, gone = _opened(old_tree, tree, after, target)
             if report == "snapshot" or before is None:
                 lines.append(format_snapshot(after))
+                opened = [line for line in opened if not line.startswith("  ")]  # items are in the snapshot
             else:
                 diff = diff_snapshots(before, after)
-                lines.append(("no visible change — the action did nothing on screen" if diff.is_empty()
-                              else format_diff(diff)) + f"\n(snapshot {after.snapshot_id})")
-            if tree.keyboard:
+                added = [el for el in diff.added if el.ref not in shown]
+                back, added = self._returned(added, before, after)
+                extra = []
+                if back:
+                    extra.append(f"+ {len(back[1])} elements back as snapshot {back[0]} showed them: "
+                                 + ", ".join(el.ref for el in back[1]))
+                removed = [el for el in diff.removed if el.handle not in gone]
+                if shown and removed and not diff.app_changed:
+                    # the screen under a menu or dialog is hidden, not gone: one line, not one per row
+                    extra.append(f"- {len(removed)} elements of the screen behind it (they return when it closes)")
+                    removed = []
+                diff = dataclasses.replace(diff, added=added, removed=removed)
+                if diff.is_empty() and not opened:
+                    hint = (" It has no name: check it is the control you meant with "
+                            "mobile_screenshot(annotate=true, show=true)." if target is not None and not target.name else "")
+                    lines.append("no visible change — the action did nothing on screen." + hint
+                                 + f"\n(snapshot {after.snapshot_id})")
+                elif diff.is_empty():
+                    lines.extend(extra)
+                    lines.append(f"(snapshot {after.snapshot_id})")
+                else:
+                    lines.append(format_diff(diff))
+                    lines.extend(extra)
+                    lines.append(f"(snapshot {after.snapshot_id})")
+                if diff.app_changed and "launcher" in (after.app.name or ""):
+                    lines.append(f"the app left the foreground: the home screen is showing ({after.app.name})")
+            lines.extend(opened)
+            if tree.keyboard and not (old_tree is not None and old_tree.keyboard):
+                lines.append("opened: keyboard (mobile_key back hides it on Android)")
+            elif tree.keyboard:
                 lines.append("keyboard is open (mobile_key back hides it on Android)")
         if not settled:
-            lines.append(f"note: the screen was still changing after {self.settle_s:g} s (animation or loading)")
+            what = "still scrolling" if action in ("swipe", "drag", "pinch") else "still changing"
+            lines.append(f"note: the screen was {what} after {cap:g} s (animation, video or loading)")
         if screenshot:
             lines.append(self._shoot(engine, self._evidence_path(None, action)))
         return "\n".join(lines)
 
+    def _returned(self, added: list[Element], before: Snapshot, after: Snapshot) -> tuple[tuple | None, list[Element]]:
+        """Split out added elements that an earlier snapshot showed exactly so (closing a menu,
+        going back): they get one line with their refs instead of a line each."""
+        earlier: dict[str, tuple[str, Element]] = {}
+        for snap in self.store._newest_first():
+            if snap is not after and snap is not before:
+                for el in snap.all_elements:
+                    earlier.setdefault(el.ref, (snap.snapshot_id, el))
+        back = [el for el in added if el.ref in earlier and not element_changes(earlier[el.ref][1], el)]
+        if len(back) < 3:  # a line each is as short
+            return None, added
+        source = earlier[back[0].ref][0]
+        return (source, back), [el for el in added if el not in back]
+
     async def act(self, do: Callable[[Engine], str], *, report: Report, screenshot: bool, action: str,
-                  before: Snapshot | None = None) -> str:
+                  before: Snapshot | None = None, target: Element | None = None) -> str:
         if before is None:
             before = self.store.latest()
-        return await self.run(self._act_sync, do, report, screenshot, action, before)
+        return await self.run(self._act_sync, do, report, screenshot, action, before, target)
 
     # ------------------------------------------------------------------ tools
     def _release(self) -> str:
@@ -295,6 +444,7 @@ class Session:
     async def snapshot(self, mode: SnapshotMode = "interactive", filter: str | None = None, offset: int = 0) -> str:
         def work() -> str:
             engine = self._engine()
+            woke = self._awake(engine)
             tree = engine.capture_tree()
             snap = self._build(tree, mode=mode, previous=self.store.latest(), offset=offset)
             shown = snap
@@ -309,16 +459,32 @@ class Session:
                 text += f" Filter {filter!r} matched {len(shown.all_elements)} of {snap.total}."
             if tree.keyboard:
                 text += "\nkeyboard is open (mobile_key back hides it on Android)"
-            return text
+            if tree.overlays:
+                text += "\nover the app: " + ", ".join(f"{o.kind} ({o.package})" for o in tree.overlays)
+            return text if woke is None else f"({woke})\n{text}"
 
         return await self.run(work)
 
+    def _device_xy(self, x: float, y: float, space: str, shot_id: str | None) -> tuple[float, float]:
+        """x/y in device pixels; from a screenshot's pixels when ``space`` is "screenshot"."""
+        if space == "device":
+            return x, y
+        if space != "screenshot":
+            raise MobilePilotError(ErrorCode.INVALID_ARGUMENT, f"coordinate_space is \"device\" or \"screenshot\", not {space!r}.")
+        if not shot_id or shot_id not in self.shots:
+            raise MobilePilotError(ErrorCode.INVALID_ARGUMENT, f"Unknown screenshot_id {shot_id!r}.",
+                                   hint="Pass the id a mobile_screenshot result printed (shot_…), from this session.")
+        scale = self.shots[shot_id][0]
+        return x / scale, y / scale
+
     async def tap(self, ref: str | None = None, x: float | None = None, y: float | None = None,
                   long_press: bool = False, report: Report = "diff", screenshot: bool = False,
-                  double: bool = False) -> str:
+                  double: bool = False, coordinate_space: str = "device", screenshot_id: str | None = None) -> str:
         if long_press and double:
             raise MobilePilotError(ErrorCode.INVALID_ARGUMENT, "Pass long_press or double, not both.")
-        before = None
+        from mobilepilot.models import Point
+
+        before = el = None
         if ref:
             before, el = self._on_screen(ref)
             if el.center is None:
@@ -326,21 +492,34 @@ class Session:
             point, label = el.center, format_element_line(el)
             warn = "" if el.enabled else " (it is disabled)"
         elif x is not None and y is not None:
-            from mobilepilot.models import Point
-
-            point, label, warn = Point(x, y), f"({x:g},{y:g})", ""
+            dx, dy = self._device_xy(x, y, coordinate_space, screenshot_id)
+            point, label, warn = Point(dx, dy), f"({dx:g},{dy:g})", ""
         else:
             raise MobilePilotError(ErrorCode.INVALID_ARGUMENT, "Pass ref, or x and y.")
         hold = 1.0 if long_press else 0.0
+        tree = self.trees.get(before.snapshot_id) if before is not None else None
+        covered = tree is not None and tree.keyboard_frame is not None and tree.keyboard_frame.contains(point)
 
         def do(engine: Engine) -> str:
+            nonlocal point
+            note = ""
+            if covered and el is not None:
+                # the keyboard sits over the target: hide it, then find the element again (the
+                # screen may have resized under it)
+                engine.press_key("back")
+                self._settle(engine, self._cap("type"))
+                again = self._build(engine.capture_tree(), mode=before.mode, previous=before).element(el.ref)
+                if again is None or again.center is None:
+                    raise MobilePilotError(ErrorCode.ELEMENT_NOT_FOUND, f"{el.ref} was under the keyboard and is gone "
+                                           "after hiding it.", hint="Take a snapshot and find it again (mobile_find).")
+                point, note = again.center, " (hid the keyboard first: it covered the target)"
             if double:
                 engine.double_tap(point.x, point.y)
-                return f"double-tapped {label}{warn}"
+                return f"double-tapped {label}{warn}{note}"
             engine.tap(point.x, point.y, hold_s=hold)
-            return f"{'long-pressed' if long_press else 'tapped'} {label}{warn}"
+            return f"{'long-pressed' if long_press else 'tapped'} {label}{warn}{note}"
 
-        return await self.act(do, report=report, screenshot=screenshot, action="tap", before=before)
+        return await self.act(do, report=report, screenshot=screenshot, action="tap", before=before, target=el)
 
     async def type(self, text: str, ref: str | None = None, clear: bool = False, submit: bool = False,
                    secret: bool = False, report: Report = "diff", screenshot: bool = False) -> str:
@@ -363,7 +542,7 @@ class Session:
             where = f" into {format_element_line(target)}" if target is not None else ""
             return f"typed {shown}{where}" + (" and pressed enter" if submit else "")
 
-        return await self.act(do, report=report, screenshot=screenshot, action="type", before=before)
+        return await self.act(do, report=report, screenshot=screenshot, action="type", before=before, target=target)
 
     async def swipe(self, direction: Literal["up", "down", "left", "right"] | None = None, ref: str | None = None,
                     from_x: float | None = None, from_y: float | None = None, to_x: float | None = None,
@@ -400,7 +579,8 @@ class Session:
 
         return await self.act(do, report=report, screenshot=screenshot, action="swipe", before=before)
 
-    def _point(self, ref: str | None, x: float | None, y: float | None, what: str):
+    def _point(self, ref: str | None, x: float | None, y: float | None, what: str, space: str = "device",
+               shot_id: str | None = None):
         """A ref's centre on the latest screen, or x/y. Returns (snapshot or None, point, label)."""
         from mobilepilot.models import Point
 
@@ -410,17 +590,18 @@ class Session:
                 raise MobilePilotError(ErrorCode.ELEMENT_NOT_ACTIONABLE, f"{ref} has no position on screen.")
             return snap, el.center, format_element_line(el)
         if x is not None and y is not None:
+            x, y = self._device_xy(x, y, space, shot_id)
             return None, Point(x, y), f"({x:g},{y:g})"
         raise MobilePilotError(ErrorCode.INVALID_ARGUMENT, f"Pass {what}_ref, or {what}_x and {what}_y.")
 
     async def drag(self, from_ref: str | None = None, from_x: float | None = None, from_y: float | None = None,
                    to_ref: str | None = None, to_x: float | None = None, to_y: float | None = None,
                    hold_s: float = 0.6, duration_s: float = 0.8, report: Report = "diff",
-                   screenshot: bool = False) -> str:
+                   screenshot: bool = False, coordinate_space: str = "device", screenshot_id: str | None = None) -> str:
         if not 0 <= hold_s <= 5 or not 0.1 <= duration_s <= 10:
             raise MobilePilotError(ErrorCode.INVALID_ARGUMENT, "hold_s is 0-5 s and duration_s 0.1-10 s.")
-        before, start, start_label = self._point(from_ref, from_x, from_y, "from")
-        other, end, end_label = self._point(to_ref, to_x, to_y, "to")
+        before, start, start_label = self._point(from_ref, from_x, from_y, "from", coordinate_space, screenshot_id)
+        other, end, end_label = self._point(to_ref, to_x, to_y, "to", coordinate_space, screenshot_id)
         before = before or other
 
         def do(engine: Engine) -> str:
@@ -466,10 +647,15 @@ class Session:
 
         return await self.act(do, report=report, screenshot=screenshot, action=key)
 
-    async def app(self, action: Literal["launch", "restart", "stop", "clear", "install", "grant", "current"], app: str | None = None,
-                  path: str | None = None, permission: str | None = None, screenshot: bool = False) -> str:
-        if action in ("launch", "restart"):
+    async def app(self, action: Literal["launch", "restart", "stop", "clear", "install", "grant", "current", "open"],
+                  app: str | None = None, path: str | None = None, permission: str | None = None,
+                  screenshot: bool = False, url: str | None = None) -> str:
+        if action == "open" and not (url and re.match(r"^[A-Za-z][\w+.-]*:\S+$", url)):
+            raise MobilePilotError(ErrorCode.INVALID_ARGUMENT, f"open needs url, a link such as https://… or myapp://…, not {url!r}.")
+        if action in ("launch", "restart", "open"):
             def do(engine: Engine) -> str:
+                if action == "open":
+                    return engine.app("open", app=app, url=url)
                 if action == "restart":
                     engine.app("stop", app=app)
                 return engine.app("launch", app=app)
@@ -506,24 +692,20 @@ class Session:
             before_sig = engine.signature()
             engine.swipe(box.x + box.w / 2, box.y + box.h * 0.75, box.x + box.w / 2, box.y + box.h * 0.25)
             scrolls += 1
-            self._settle(engine)
+            self._settle(engine, self._cap("swipe"))
             if engine.signature() == before_sig:
                 raise MobilePilotError(ErrorCode.ELEMENT_NOT_FOUND,
                                        f"Nothing matching {needle!r}: scrolled to the end of the list ({scrolls} scrolls).",
                                        hint="It may be above: mobile_swipe direction=up, then mobile_find again.")
 
     async def find(self, text: str, scroll: bool = True, max_scrolls: int = 8) -> str:
-        return await self.run(self._find_sync, text.casefold(), scroll, max_scrolls, timeout_s=ENGINE_TIMEOUT_S * 2)
+        return await self.run(self._find_sync, text.casefold(), scroll, max_scrolls, timeout_s=CALL_CEILING_S)
 
     def _wait_sync(self, needle: str | None, until: str, timeout_s: float) -> str:
         engine = self._engine()
         if until == "idle":
             start = time.monotonic()
-            settle, self.settle_s = self.settle_s, timeout_s
-            try:
-                ok = self._settle(engine)
-            finally:
-                self.settle_s = settle
+            ok = self._settle(engine, timeout_s)
             took = time.monotonic() - start
             return f"screen idle after {took:.1f} s" if ok else f"still changing after {timeout_s:g} s"
         if not needle:
@@ -546,13 +728,20 @@ class Session:
 
     async def wait_for(self, text: str | None = None, until: Literal["visible", "gone", "idle"] = "visible",
                        timeout_s: float = 10.0) -> str:
-        timeout_s = min(max(timeout_s, 0.5), 120.0)
+        timeout_s = min(max(timeout_s, 0.5), WAIT_MAX_S)
         return await self.run(self._wait_sync, text.casefold() if text else None, until, timeout_s,
-                              timeout_s=timeout_s + ENGINE_TIMEOUT_S)
+                              timeout_s=CALL_CEILING_S)
 
-    async def screenshot(self, path: str | None = None, show: bool = False) -> str | list[Any]:
+    async def screenshot(self, path: str | None = None, show: bool = False, annotate: bool = False) -> str | list[Any]:
         target = self._evidence_path(path, "screen")
-        text = await self.run(lambda: self._shoot(self._engine(), target))
+
+        def work() -> str:
+            engine = self._engine()
+            if annotate or self.store.latest() is None:  # refs to draw, and the screen size for the scale
+                self._build(engine.capture_tree(), previous=self.store.latest())
+            return self._shoot(engine, target, annotate=annotate)
+
+        text = await self.run(work)
         return [text, Image(path=target)] if show else text
 
     async def locate(self, refs: list[str]) -> str:
@@ -598,16 +787,17 @@ def build_server(session: Session | None = None) -> _Server:
         return await session.devices(select, release)
 
     @tool
-    async def mobile_app(action: Literal["launch", "restart", "stop", "clear", "install", "grant", "current"],
+    async def mobile_app(action: Literal["launch", "restart", "stop", "clear", "install", "grant", "current", "open"],
                          app: str | None = None, path: str | None = None, permission: str | None = None,
-                         screenshot: bool = False) -> str:
+                         screenshot: bool = False, url: str | None = None) -> str:
         """App lifecycle. launch/restart/stop/clear take `app` (package or bundle id); launch and
         restart return the first screen's snapshot, and restart (stop, then launch) is how a crawl
         starts from a known screen. install takes a local `path` (.apk, or a simulator .app). grant takes
         `app` + `permission` (CAMERA, android.permission.POST_NOTIFICATIONS; iOS: camera, photos,
         location). clear ERASES the app's data. current names the foreground app. screenshot=true
-        on launch/restart saves the first screen as evidence in the same call."""
-        return await session.app(action, app, path, permission, screenshot)
+        on launch/restart saves the first screen as evidence in the same call. open takes `url` (a
+        deep link or web address; optional `app` to pick the handler) and returns the screen."""
+        return await session.app(action, app, path, permission, screenshot, url)
 
     @tool
     async def mobile_snapshot(mode: Literal["interactive", "full", "text"] = "interactive", filter: str | None = None,
@@ -620,10 +810,14 @@ def build_server(session: Session | None = None) -> _Server:
     @tool
     async def mobile_tap(ref: str | None = None, x: float | None = None, y: float | None = None,
                          long_press: bool = False, report: Literal["diff", "snapshot", "none"] = "diff",
-                         screenshot: bool = False, double: bool = False) -> str:
+                         screenshot: bool = False, double: bool = False,
+                         coordinate_space: Literal["device", "screenshot"] = "device",
+                         screenshot_id: str | None = None) -> str:
         """Tap an element by ref (preferred) or x/y; long_press holds it, double taps twice. Waits for the screen to
-        settle and returns what changed. screenshot=true saves the step's evidence in the same call."""
-        return await session.tap(ref, x, y, long_press, report, screenshot, double)
+        settle and returns what changed, including any menu or dialog it opened. x/y from a
+        screenshot image: coordinate_space="screenshot" with that screenshot's id. A keyboard
+        covering the target is hidden first. screenshot=true saves the step's evidence."""
+        return await session.tap(ref, x, y, long_press, report, screenshot, double, coordinate_space, screenshot_id)
 
     @tool
     async def mobile_type(text: str, ref: str | None = None, clear: bool = False, submit: bool = False,
@@ -652,12 +846,16 @@ def build_server(session: Session | None = None) -> _Server:
     async def mobile_drag(from_ref: str | None = None, from_x: float | None = None, from_y: float | None = None,
                           to_ref: str | None = None, to_x: float | None = None, to_y: float | None = None,
                           hold_s: float = 0.6, duration_s: float = 0.8,
-                          report: Literal["diff", "snapshot", "none"] = "diff", screenshot: bool = False) -> str:
+                          report: Literal["diff", "snapshot", "none"] = "diff", screenshot: bool = False,
+                          coordinate_space: Literal["device", "screenshot"] = "device",
+                          screenshot_id: str | None = None) -> str:
         """Press, hold, move and release: drag and drop, reorder a list, move a slider's thumb.
-        From a ref or point to a ref or point. hold_s is the press before moving (0.6 starts
-        Android drag-and-drop; 0 for sliders and maps). Returns the diff."""
+        From a ref or point to a ref or point (points from a screenshot: coordinate_space=
+        "screenshot" + screenshot_id). hold_s is the press before moving (0.6 starts Android
+        drag-and-drop; 0 for sliders and maps). Moving within a row of tiles, aim past the
+        neighbour's centre. Returns the diff."""
         return await session.drag(from_ref, from_x, from_y, to_ref, to_x, to_y, hold_s, duration_s,
-                                  report, screenshot)
+                                  report, screenshot, coordinate_space, screenshot_id)
 
     @tool
     async def mobile_pinch(zoom: Literal["in", "out"], ref: str | None = None,
@@ -692,14 +890,16 @@ def build_server(session: Session | None = None) -> _Server:
     async def mobile_wait_for(text: str | None = None, until: Literal["visible", "gone", "idle"] = "visible",
                               timeout_s: float = 10.0) -> str:
         """Wait on the server until `text` is visible, is gone, or the screen is idle. Use it for
-        loading screens instead of snapshotting in a loop; a timeout is a failed step, not a retry."""
+        loading screens, spinners and toasts instead of snapshotting in a loop. timeout_s is at most
+        45; a timeout is a failed step, not a retry."""
         return await session.wait_for(text, until, timeout_s)
 
     @tool
-    async def mobile_screenshot(path: str | None = None, show: bool = False) -> str | list[Any]:
-        """Save a PNG (longest side ≤1280) and return its path; a relative `path` lands in the
-        evidence folder. show=true also returns the image, for screens the tree cannot describe."""
-        return await session.screenshot(path, show)
+    async def mobile_screenshot(path: str | None = None, show: bool = False, annotate: bool = False) -> str | list[Any]:
+        """Save a PNG (longest side ≤1280) and return its path, id and scale; a relative `path` lands
+        in the evidence folder. show=true also returns the image. annotate=true draws every ref on
+        its element: use it to match an unlabeled icon to its ref. Secure screens come out black."""
+        return await session.screenshot(path, show, annotate)
 
     @tool
     async def mobile_locate(refs: list[str]) -> str:

@@ -15,7 +15,7 @@ from mobilepilot.errors import ErrorCode, MobilePilotError
 from mobilepilot.models import RawTree
 
 Platform = Literal["android", "ios"]
-AppAction = Literal["launch", "stop", "clear", "install", "grant", "current"]
+AppAction = Literal["launch", "stop", "clear", "install", "grant", "current", "open"]
 
 KEYS: tuple[str, ...] = ("back", "home", "enter", "delete", "tab", "app_switch", "volume_up", "volume_down", "search",
                          "notifications", "quick_settings")
@@ -84,8 +84,13 @@ class Engine(ABC):
 
     @abstractmethod
     def app(self, action: AppAction, *, app: str | None = None, path: str | None = None,
-            permission: str | None = None) -> str:
-        """App lifecycle; returns a one-line summary of what happened."""
+            permission: str | None = None, url: str | None = None) -> str:
+        """App lifecycle, and "open" for a deep link; returns a one-line summary of what happened."""
+
+    def ensure_awake(self) -> str | None:
+        """Make the screen usable: wake it, dismiss a keyguard with no PIN. Returns what it did,
+        or None. A PIN, pattern or password raises NEEDS_USER: never type one."""
+        return None
 
     @abstractmethod
     def screenshot(self, path: str, *, max_side: int = 1280) -> tuple[int, int]:

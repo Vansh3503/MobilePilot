@@ -22,7 +22,7 @@ from typing import Literal
 
 from mobilepilot.engine.base import AppAction, Device, Engine
 from mobilepilot.errors import ErrorCode, MobilePilotError
-from mobilepilot.models import AppInfo, RawNode, RawTree, Rect, WindowInfo
+from mobilepilot.models import AppInfo, Overlay, RawNode, RawTree, Rect, WindowInfo
 
 # Simple class name (after the last dot) → (AX role, AX subrole). Anything missing is a layout.
 _ROLES: dict[str, tuple[str, str | None]] = {
@@ -59,6 +59,14 @@ _PASSIVE_IF_CLICKABLE = {"AXStaticText", "AXImage", "AXUnknown"}
 
 _BOUNDS = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
 _SYSTEM_UI = "com.android.systemui"
+_PERMISSION_PACKAGES = {"com.google.android.permissioncontroller", "com.android.permissioncontroller"}
+SYSTEM_DIALOG_PACKAGES = _PERMISSION_PACKAGES | {"android", _SYSTEM_UI}
+"""Foreground packages whose windows ask the person something (permissions, choosers, crashes)."""
+_DIALOG_IDS = ("alertTitle", "parentPanel", "buttonPanel", "button1", "button2")
+_CRASH_WORDS = ("isn't responding", "keeps stopping", "has stopped")
+_SLIDER_ID = re.compile(r"(slider|seek)", re.I)
+"""Android 17's volume sliders are an empty ``slider_frame`` with nothing inside in the tree
+(Pixel 7a, 2026-11-04); a frame with such an id is the only trace of the control."""
 
 
 def _flag(attrs: dict[str, str], name: str) -> bool:
@@ -77,6 +85,8 @@ def _node(el: ET.Element, parent_role: str | None) -> RawNode:
     a = el.attrib
     cls = a.get("class", "")
     role, subrole = _ROLES.get(cls.rpartition(".")[2], ("AXUnknown", None))
+    if role == "AXUnknown" and not len(el) and _SLIDER_ID.search(a.get("resource-id", "").rpartition("/")[2]):
+        role = "AXSlider"
     clickable = _flag(a, "clickable") or _flag(a, "long-clickable")
     text, desc, hint = a.get("text") or None, a.get("content-desc") or None, a.get("hint") or None
     if clickable and role in _PASSIVE_IF_CLICKABLE:
@@ -156,7 +166,9 @@ def parse_hierarchy(
         raise MobilePilotError(ErrorCode.COMMAND_FAILED, "The hierarchy dump contains a DTD; refusing to parse it.")
     root_el = ET.fromstring(xml)
     windows = [w for w in root_el if w.tag == "node"]
-    keyboard = any("inputmethod" in w.get("package", "") for w in windows)
+    ime = [w for w in windows if "inputmethod" in w.get("package", "")]
+    keyboard = bool(ime)
+    keyboard_frame = _frame(ime[0].get("bounds")) if ime else None
     windows = [w for w in windows if "inputmethod" not in w.get("package", "")]
     if any(w.get("package") != _SYSTEM_UI for w in windows):
         windows = [w for w in windows if w.get("package") != _SYSTEM_UI]
@@ -167,6 +179,7 @@ def parse_hierarchy(
         frames = [n.frame for n in nodes if n.frame is not None]
         size = (int(max((f.x + f.w for f in frames), default=0)), int(max((f.y + f.h for f in frames), default=0)))
     screen = Rect(0, 0, size[0], size[1])
+    overlays = _overlays(windows, nodes, package, screen)
     title = activity or package
     root = RawNode(role="AXApplication", title=package, frame=screen, children=nodes)
     return RawTree(
@@ -176,7 +189,58 @@ def parse_hierarchy(
         node_count=sum(1 for _ in root.walk()),
         elapsed_ms=(time.perf_counter() - start) * 1000,
         keyboard=keyboard,
+        keyboard_frame=keyboard_frame,
+        overlays=overlays,
     )
+
+
+def _overlays(windows: list[ET.Element], nodes: list[RawNode], package: str, screen: Rect) -> list[Overlay]:
+    """Every window except the app's main one (its largest own window), named by what it is.
+    A system dialog in the foreground (a permission prompt is its own activity) counts whole."""
+    def area(n: RawNode) -> float:
+        return n.frame.area if n.frame is not None else 0.0
+
+    own = [n for w, n in zip(windows, nodes, strict=True) if w.get("package") == package]
+    main = None if package in SYSTEM_DIALOG_PACKAGES or not own else max(own, key=area)
+    if main is not None and area(main) < 0.8 * screen.area:
+        # Android 17 dumps only the focused window: with a menu open, the menu is the app's only
+        # window and the screen under it is missing (Pixel 7a, Clock's overflow, 2026-11-04).
+        main = None
+    found = []
+    for w, n in zip(windows, nodes, strict=True):
+        if n is main:
+            continue
+        pkg = w.get("package", "")
+        ids = [e.get("resource-id", "").rpartition("/")[2] for e in w.iter("node")]
+        words = " ".join(f"{e.get('text', '')} {e.get('content-desc', '')}" for e in w.iter("node")).casefold()
+        f = n.frame
+        if pkg in _PERMISSION_PACKAGES:
+            kind = "permission dialog"
+        elif pkg == "android" and any(word in words for word in _CRASH_WORDS):
+            kind = "crash/ANR dialog"
+        elif pkg != package or pkg in SYSTEM_DIALOG_PACKAGES:
+            kind = "system dialog"
+        elif any("bottom_sheet" in i for i in ids) or (
+                f is not None and f.y + f.h >= screen.h - 2 and f.w >= screen.w - 2 and f.h < screen.h * 0.9):
+            kind = "bottom sheet"
+        elif any(i in _DIALOG_IDS for i in ids):
+            kind = "dialog"
+        elif any(e.get("class", "").rpartition(".")[2] in ("ListView", "RecyclerView") for e in w.iter("node")):
+            kind = "popup menu"
+        else:
+            kind = "popup"
+        found.append(Overlay(kind, pkg, f, frozenset(x.handle for x in n.walk() if x.handle is not None)))
+    return found
+
+
+_TICKING = re.compile(r'(?:text|content-desc)="[^"]*\d[^"]*"')
+
+
+def fingerprint(xml: str) -> int:
+    """CRC of a dump with the digits inside text left out: a clock, a video position or a
+    download percentage changes every frame and would keep a screen "unsettled" for the whole
+    budget. Layout (bounds) still counts, so scrolling and transitions are waited for."""
+    return zlib.crc32(_TICKING.sub(lambda m: re.sub(r"\d", "", m.group()), xml).encode())
 
 
 # --------------------------------------------------------------------------- adb discovery
@@ -298,7 +362,7 @@ class AndroidEngine(Engine):
 
     def signature(self) -> int:
         """A cheap fingerprint of the screen (no app lookup), for waiting until it settles."""
-        return zlib.crc32(self._call(self._d.dump_hierarchy).encode())
+        return fingerprint(self._call(self._d.dump_hierarchy))
 
     def tap(self, x: float, y: float, *, hold_s: float = 0.0) -> None:
         if hold_s > 0:
@@ -369,9 +433,38 @@ class AndroidEngine(Engine):
                                    hint="Use one of: " + ", ".join(_KEYS) + ".")
         self._call(self._d.press, _KEYS[key])
 
+    def ensure_awake(self) -> str | None:
+        # ~one shell round trip; the server calls this only after 10 s without an action, since a
+        # phone never times out while it is being driven.
+        out = self._call(self._d.shell, "dumpsys power 2>/dev/null | grep -m1 -o 'mWakefulness=[A-Za-z]*'; "
+                         "dumpsys window 2>/dev/null | grep -m1 -o 'isKeyguardShowing=[a-z]*'; "
+                         "dumpsys trust 2>/dev/null | grep -m1 -o 'deviceLocked=[01]'").output
+        did = []
+        if "mWakefulness=Awake" not in out:
+            self._call(self._d.shell, ["input", "keyevent", "KEYCODE_WAKEUP"])
+            did.append("woke the screen")
+            time.sleep(0.6)
+        if "isKeyguardShowing=true" in out or did:
+            if "deviceLocked=1" in out:
+                raise MobilePilotError(ErrorCode.NEEDS_USER, "The phone is locked with a PIN, pattern or password.",
+                                       hint="Ask the person to unlock it (and keep the screen on), then retry. "
+                                       "Never type a PIN.")
+            if "isKeyguardShowing=true" in out:
+                self._call(self._d.shell, ["wm", "dismiss-keyguard"])
+                did.append("dismissed the lock screen (no PIN)")
+                time.sleep(0.6)
+        return ", ".join(did) or None
+
     def app(self, action: AppAction, *, app: str | None = None, path: str | None = None,
-            permission: str | None = None) -> str:
+            permission: str | None = None, url: str | None = None) -> str:
         d = self._d
+        if action == "open":
+            cmd = ["am", "start", "-W", "-a", "android.intent.action.VIEW", "-d", url or ""]
+            out = self._call(d.shell, cmd + (["-p", app] if app else []), timeout=60).output
+            if "Error" in out or "unable to resolve" in out.lower():
+                raise MobilePilotError(ErrorCode.APP_NOT_FOUND, f"No app opens {url}: {out.strip()[:300]}",
+                                       hint="Check the link, or pass app with the package that should handle it.")
+            return f"opened {url}" + (f" in {app}" if app else "")
         if action == "current":
             cur = self._foreground()
             return f"{cur.get('package')} / {cur.get('activity')} (pid {cur.get('pid')})"

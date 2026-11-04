@@ -372,6 +372,14 @@ class _Builder:
         digest = None
         if whole is not None and value != whole:
             digest = hashlib.blake2b(whole.encode("utf-8", "surrogatepass"), digest_size=8).hexdigest()
+        interactive = is_interactive(node)
+        extra = self._extra(node, name)
+        if node.role == "AXButton" and name is None and node.frame is not None:
+            # MobilePilot change: an unlabeled icon (back arrow, ⋮, ×) gets where it is, so the
+            # model can tell "top-left button" from "top-right button" without a screenshot.
+            screen = self._tree.window.frame if self._tree.window is not None else self._tree.root.frame
+            if screen is not None and screen.w and screen.h:
+                extra["where"] = _where(node.frame.center, screen)
         return Element(
             ref=f"e{len(self.elements) + 1}",
             role=short_role(node.role, node.subrole),
@@ -386,9 +394,9 @@ class _Builder:
             selected=node.selected,
             expanded=node.expanded,
             secure=secure,
-            interactive=is_interactive(node),
+            interactive=interactive,
             actions=tuple(node.actions),
-            extra=self._extra(node, name),
+            extra=extra,
             locator=Locator(
                 pid=self._tree.app.pid,
                 window_id=self._window_id,
@@ -426,6 +434,14 @@ class _Builder:
 
 def _count_nodes(root: RawNode) -> int:
     return sum(1 for _ in root.walk())
+
+
+def _where(c, screen) -> str:
+    """``top-left`` … ``bottom-right`` by screen thirds (rows: top 15 %, bottom 15 %)."""
+    fy, fx = (c.y - screen.y) / screen.h, (c.x - screen.x) / screen.w
+    row = "top" if fy < 0.15 else "bottom" if fy > 0.85 else "middle"
+    col = "left" if fx < 1 / 3 else "right" if fx > 2 / 3 else "centre"
+    return f"{row}-{col}"
 
 
 def build_snapshot(

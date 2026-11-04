@@ -162,3 +162,20 @@ class RawTree:
     elapsed_ms: float = 0.0
     keyboard: bool = False
     """The soft keyboard is open (its keys are left out of the tree)."""
+    keyboard_frame: Rect | None = None
+    """Where the keyboard covers the screen, when the engine knows."""
+    overlays: list[Overlay] = field(default_factory=list)
+    """Windows drawn over the app's own: menus, drop-downs, dialogs, sheets, system prompts."""
+
+
+@dataclass(slots=True)
+class Overlay:
+    """A window over the app's main one (Android: a top-level window in the dump)."""
+
+    kind: str
+    """``popup menu``, ``drop-down list``, ``dialog``, ``bottom sheet``, ``system dialog``,
+    ``permission dialog`` or ``crash/ANR dialog``."""
+    package: str
+    frame: Rect | None
+    handles: frozenset = frozenset()
+    """Handles of its nodes, to pick its elements out of a snapshot."""

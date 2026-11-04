@@ -77,6 +77,9 @@ def _details(el: Element) -> list[str]:
         parts.append(", ".join(facts))
     if el.states:
         parts.append(", ".join(el.states))
+    where = el.extra.get("where")
+    if where:
+        parts.append(f"unlabeled, {where}")
     parts.extend(locator_hints(el))
     center = el.center
     if el.interactive and center is not None:
@@ -146,7 +149,9 @@ def _footer(snap: Snapshot) -> str:
     if snap.next_offset is not None:
         text += f" More: offset={snap.next_offset}."
     if snap.total == 0 and snap.mode == "interactive":
-        text += ' Nothing actionable found; try mode="full", mobile_find, or a screenshot (a WebView or a game may expose no tree).'
+        text += (' Nothing actionable found: this screen may have no accessibility tree (a game, Flutter, a canvas'
+                 ' or a thin web view). Try mode="full"; else mobile_screenshot(annotate=true, show=true) and tap'
+                 ' its pixels with coordinate_space="screenshot".')
     if snap.truncated:
         text += " The screen was too large to capture completely; narrow it with filter or use mobile_find."
     return text

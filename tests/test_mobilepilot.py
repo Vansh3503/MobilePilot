@@ -173,7 +173,10 @@ def test_actions_return_diffs_and_refs_survive_going_back(tmp_path):
     assert f"~ {switch} switch unchecked" in texts[3]           # toggling is a change, not add+remove
     assert "step-01-tap.png" in texts[3] and (tmp_path / "step-01-tap.png").exists()
     airplane = _ref(texts[1], '"Airplane mode"')
-    assert f"+ {airplane} row \"Airplane mode\"" in texts[4]    # back: the old ref returns with its element
+    # back: the old refs return with their elements, as one line instead of one per row
+    back = next(line for line in texts[4].splitlines() if "elements back as snapshot" in line)
+    assert airplane in back.split(": ", 1)[1].split(", "), texts[4]
+    assert '"Airplane mode"' not in texts[4]
     assert engine.log[-1] == "key back"
 
 
