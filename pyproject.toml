@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mobilepilot"
+version = "0.1.0"
+description = "MobilePilot: an MCP server that drives Android and iOS apps through the accessibility tree."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "Vansh Malhotra" }]
+dependencies = [
+  # 1.x too: Stuntman bundles MobilePilot into a backend venv that pins mcp<2 (server.py shims it)
+  "mcp>=1.28,<3",
+  "anyio>=4.11",
+  "pillow>=10.4",
+  "uiautomator2>=3.7,<4",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+mobilepilot = "mobilepilot.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mobilepilot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

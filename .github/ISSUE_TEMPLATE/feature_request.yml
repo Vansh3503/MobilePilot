@@ -1,0 +1,15 @@
+name: Feature request
+description: A gesture, tool or device MobilePilot should support.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you are trying to do
+      description: The app and screen, and what the agent cannot do today.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Suggested behaviour

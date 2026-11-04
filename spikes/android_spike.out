@@ -1,0 +1,12 @@
+(a) adb uiautomator dump               median    2216 ms  min   2087  max   2373
+    bytes 16983
+(a) adb input tap                      median      48 ms  min     40  max     55
+adb exec-out screencap -p              median     107 ms  min    101  max    119
+    bytes 33918
+(b) u2 connect+server start                700 ms
+(b) u2 dump_hierarchy                  median      51 ms  min     46  max     54
+    chars 34501
+(b) u2 dump_hierarchy compressed       median      48 ms  min     45  max     58
+    chars 34501
+(b) u2 click                           median     150 ms  min    144  max    153
+(b) u2 screenshot (PIL)                median      29 ms  min     26  max    116

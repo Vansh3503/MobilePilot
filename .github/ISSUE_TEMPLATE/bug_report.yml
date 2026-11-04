@@ -1,0 +1,28 @@
+name: Bug report
+description: Something MobilePilot did wrong on a device or emulator.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The tool call, what you expected and what you got. Paste the tool result.
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      description: Model and OS version, e.g. "Pixel 7a, Android 17" or "API 34 emulator".
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: mobilepilot doctor
+      description: Output of `mobilepilot doctor`. Remove serial numbers and personal data.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: MobilePilot version or commit
