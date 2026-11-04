@@ -238,7 +238,7 @@ def test_when_the_person_changes_the_screen_the_action_works_from_the_real_one(t
     up = _ref(_text(first), "id=up")
     engine.current = "menu"  # the person opened the menu by hand
     out = driver.run([("mobile_tap", {"ref": up})])
-    assert not out[0].is_error and "the screen had changed since the last result" in _text(out[0]), _text(out[0])
+    assert not out[0].is_error and "since the last result" not in _text(out[0]), _text(out[0])  # same place: no noise
     assert engine.log[-1] == "tap 24,48"
 
     engine.screens["other"] = dump(node("FrameLayout", "[0,0][320,640]", children=node(
@@ -259,3 +259,134 @@ def test_an_unchanged_screen_costs_no_second_capture(tmp_path):
     out = driver.run([("mobile_snapshot", {}), ("mobile_tap", lambda out: {"ref": _ref(_text(out[0]), "id=up")})])
     assert "had changed" not in _text(out[1])
     assert len(captures) == 3  # the snapshot, the fake's own hit test, the diff; no rebase capture
+
+
+def test_a_rotation_is_reported_although_no_name_or_state_changed(tmp_path):
+    driver, _, _ = _driver(tmp_path)
+    out = driver.run([("mobile_snapshot", {}), ("mobile_rotate", {"orientation": "landscape"}),
+                      ("mobile_rotate", {"orientation": "auto"})])
+    text = _text(out[1])
+    assert "screen is now 640×320 (landscape)" in text and "no visible change" not in text, text
+    assert "screen is now 320×640 (portrait)" in _text(out[2])
+
+
+def test_a_material_picker_with_cancel_and_ok_is_a_dialog():
+    picker = node("FrameLayout", "[100,600][980,1900]", children=(
+        node("Button", "[600,1780][720,1860]", text="Cancel", rid=f"{PKG}:id/material_timepicker_cancel_button",
+             clickable=True)
+        + node("Button", "[800,1780][920,1860]", text="OK", rid=f"{PKG}:id/material_timepicker_ok_button",
+               clickable=True)))
+    tree = parse_hierarchy(dump(picker), package=PKG, size=(1080, 2400))
+    assert [o.kind for o in tree.overlays] == ["dialog"]
+
+
+def test_typing_on_a_screen_without_a_text_field_is_refused(tmp_path):
+    keypad = dump(node("FrameLayout", "[0,0][320,640]", children=node("Button", "[0,0][100,100]", text="1",
+                                                                          clickable=True)))
+    engine = FakeEngine({"keypad": keypad}, "keypad", package=PKG)
+    session = Session(list_devices=lambda: [PHONE], connect=lambda d: engine, screenshots_dir=tmp_path,
+                      poll_s=0, first_look_s=0, settle_s=0.05)
+    out = _Driver(build_server(session)).run([("mobile_snapshot", {}), ("mobile_type", {"text": "130"})])
+    assert out[1].is_error and "no text field" in _text(out[1]) and engine.typed == []
+
+
+def test_an_empty_web_view_is_not_reported_as_nothing_happening(tmp_path):
+    web = dump(node("FrameLayout", "[0,0][320,640]", children=node("WebView", "[0,40][320,640]")))
+    assert parse_hierarchy(web, package=PKG, size=(320, 640)).empty_web
+    assert not parse_hierarchy(dump(MAIN), package=PKG, size=(320, 640)).empty_web
+    engine = FakeEngine({"web": web}, "web", package=PKG)
+    session = Session(list_devices=lambda: [PHONE], connect=lambda d: engine, screenshots_dir=tmp_path,
+                      poll_s=0, first_look_s=0, settle_s=0.05)
+    out = _Driver(build_server(session)).run([("mobile_snapshot", {}), ("mobile_swipe", {"direction": "down"}),
+                                              ("mobile_find", {"text": "History"})])
+    assert "no visible change" not in _text(out[1]) and "not in the accessibility tree" in _text(out[1])
+    assert out[2].is_error and "Chrome drops it" in _text(out[2]) and "end of the list" not in _text(out[2])
+
+
+def test_many_removed_rows_collapse_and_few_stay_listed(tmp_path):
+    def screen(n):
+        return dump(node("FrameLayout", "[0,0][320,640]", children="".join(
+            node("Button", f"[0,{i * 60}][300,{i * 60 + 50}]", text=f"Item {i}", clickable=True) for i in range(n))
+            + node("Button", "[0,600][300,640]", text="Go", clickable=True)))
+
+    for count, collapsed in ((8, True), (3, False)):
+        engine = FakeEngine({"list": screen(count), "empty": dump(node("FrameLayout", "[0,0][320,640]"))}, "list",
+                            package=PKG, taps={("list", "Go"): "empty"}, activities={"list": ".A", "empty": ".A"})
+        session = Session(list_devices=lambda: [PHONE], connect=lambda d, e=engine: e, screenshots_dir=tmp_path,
+                          poll_s=0, first_look_s=0, settle_s=0.05)
+        out = _Driver(build_server(session)).run([("mobile_snapshot", {}),
+                                                  ("mobile_tap", lambda out: {"ref": _ref(_text(out[0]), '"Go"')})])
+        text = _text(out[1])
+        if collapsed:
+            assert f'- {count + 1} elements gone, e.g. "Item 0", "Item 1", "Item 2"' in text, text
+        else:
+            assert text.count('- button "Item') == count, text
+
+
+def test_a_moved_target_is_tapped_where_it_is_now_and_said_so(tmp_path):
+    driver, engine, _ = _driver(tmp_path)
+    first = driver.run([("mobile_snapshot", {})])[0]
+    save = _ref(_text(first), '"Save"')
+    engine.screens["main"] = engine.screens["main"].replace("[16,400][304,448]", "[16,300][304,348]")  # scrolled up
+    out = driver.run([("mobile_tap", {"ref": save})])
+    assert f"{save} had moved since the last result" in _text(out[0]) and engine.log[-1] == "tap 160,324", engine.log
+
+
+def test_a_gesture_on_a_picture_says_the_picture_changed(tmp_path):
+    driver, engine, _ = _driver(tmp_path)
+    engine.picture = 1
+    out = driver.run([("mobile_snapshot", {}), ("mobile_drag", {"from_x": 10, "from_y": 300, "to_x": 200, "to_y": 300,
+                                                                "hold_s": 0})])
+    assert "the picture did" in _text(out[1]) and "did nothing" not in _text(out[1]), _text(out[1])
+    engine.picture = None
+    out = driver.run([("mobile_drag", {"from_x": 10, "from_y": 300, "to_x": 200, "to_y": 300, "hold_s": 0})])
+    assert "no visible change" in _text(out[0])
+
+
+def test_the_no_tree_hint_is_for_nameless_screens_not_small_dialogs():
+    from mobilepilot.perception.format import format_snapshot
+    from mobilepilot.perception.snapshot import build_snapshot
+
+    def text(xml):
+        return format_snapshot(build_snapshot(parse_hierarchy(xml, package=PKG, size=(320, 640)), snapshot_id="s"))
+
+    game = dump(node("FrameLayout", "[0,0][320,640]", children=node("EditText", "[0,0][320,40]", clickable=True)))
+    dialog = dump(node("FrameLayout", "[0,0][320,640]", children=node("Button", "[0,0][100,40]", text="OK",
+                                                                      clickable=True)))
+    assert "Little or nothing in the tree" in text(game)
+    assert "Little or nothing in the tree" not in text(dialog)
+
+
+def test_find_behind_a_dialog_says_the_dialog_is_in_the_way(tmp_path):
+    driver, _, _ = _driver(tmp_path, start="sheet")
+    out = driver.run([("mobile_find", {"text": "nothing like this"})])
+    assert out[0].is_error and "A bottom sheet is open over the app" in _text(out[0]), _text(out[0])
+
+
+def test_the_notification_shade_is_not_a_question():
+    shade = node("FrameLayout", "[0,0][320,640]", pkg="com.android.systemui", children=node(
+        "Button", "[0,100][320,160]", text="Wi-Fi", clickable=True, pkg="com.android.systemui"))
+    # as dumped live: the shade is the focused window, so it is all there is
+    tree = parse_hierarchy(dump(shade), package="com.android.systemui", size=(320, 640))
+    assert [o.kind for o in tree.overlays] == ["notification shade"]
+
+
+def test_a_compose_button_is_named_from_the_content_desc_inside_it():
+    from mobilepilot.perception.format import format_snapshot
+    from mobilepilot.perception.snapshot import build_snapshot
+
+    row = node("View", "[63,1048][891,1211]", clickable=True, children=node("View", "[63,1048][891,1211]", children=(
+        node("View", "[252,1048][891,1211]", desc="Calculator&#10;SOLITUDE&#10;Tools"))))
+    xml = dump(node("FrameLayout", "[0,0][1080,2400]", children=row))
+    text = format_snapshot(build_snapshot(parse_hierarchy(xml, package=PKG, size=(1080, 2400)), snapshot_id="s"))
+    assert "Calculator" in text and "unlabeled" not in text, text
+
+
+def test_a_full_screen_bottom_sheet_dialog_is_a_sheet():
+    sheet = node("FrameLayout", "[0,0][1080,2400]", children=(
+        node("View", "[0,0][1080,2400]", rid=f"{PKG}:id/touch_outside", clickable=True)
+        + node("FrameLayout", "[0,1900][1080,2400]", rid=f"{PKG}:id/design_bottom_sheet", children=node(
+            "Button", "[40,2000][1040,2100]", text="Use my current location", clickable=True))))
+    tree = parse_hierarchy(dump(sheet), package=PKG, size=(1080, 2400))
+    assert [o.kind for o in tree.overlays] == ["bottom sheet"]
+    assert any(n.description == "Outside the sheet (closes it)" for n in tree.root.walk())

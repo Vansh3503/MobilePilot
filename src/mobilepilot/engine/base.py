@@ -89,6 +89,11 @@ class Engine(ABC):
             permission: str | None = None, url: str | None = None) -> str:
         """App lifecycle, and "open" for a deep link; returns a one-line summary of what happened."""
 
+    def pixels(self) -> int | None:
+        """A coarse fingerprint of the picture (status bar left out), for gestures on content the
+        tree cannot see: maps, canvases, games. None when the engine cannot take one."""
+        return None
+
     def ensure_awake(self) -> str | None:
         """Make the screen usable: wake it, dismiss a keyguard with no PIN. Returns what it did,
         or None. A PIN, pattern or password raises NEEDS_USER: never type one."""

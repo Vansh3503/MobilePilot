@@ -165,6 +165,8 @@ class RawTree:
     keyboard_frame: Rect | None = None
     """Where the keyboard covers the screen, when the engine knows."""
     overlays: list[Overlay] = field(default_factory=list)
+    empty_web: bool = False
+    """A web view is on screen with no content in the tree (Chrome drops it after a scroll)."""
     """Windows drawn over the app's own: menus, drop-downs, dialogs, sheets, system prompts."""
 
 

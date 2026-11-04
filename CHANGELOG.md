@@ -5,6 +5,26 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+Found by driving Calculator, Clock, Chrome, YouTube, Maps, Gmail, Messages, Contacts, Photos,
+Play Store, Amazon and a game on a Pixel 7a (Android 17):
+
+- Rotation was reported as "no visible change": a diff compares names and states, not positions,
+  and the capture ran before the rotation finished. Now it waits for the new orientation and
+  says `screen is now 2400×1080 (landscape)`.
+- Jetpack Compose apps (Play Store) put a row's text in the content-desc of plain Views, so its
+  buttons read "unlabeled"; they are now named from it ("ClevCalc - Calculator Cleveni Inc. …").
+- Full-screen BottomSheetDialogs (Amazon's location sheet) were missed: their window fills the
+  screen behind a `touch_outside` backdrop. They are `opened: bottom sheet`, and the backdrop is
+  "Outside the sheet (closes it)". Material time/date pickers are dialogs; the notification
+  shade is `notification shade`, not a question for the person.
+- Gestures on maps, canvases and games no longer claim "did nothing" when the picture changed
+  (a coarse pixel fingerprint, taken only for drag/pinch/swipe). A web view with no content in
+  the tree (Chrome drops it after a scroll) is said so, in diffs and in `mobile_find`.
+- `mobile_type` on a screen with no text field is refused instead of claiming it typed.
+- Long removed lists collapse to a count and three names; a loading indicator is mentioned;
+  `mobile_find` behind a dialog names the dialog; the no-tree hint is only for nameless screens.
+- "Someone may have used the phone" is said only when the target moved or the app changed
+  (Maps updates itself); drag sends one move per 50 ms (a 0.8 s drag took 6.2 s, now ~3.5 s).
 - If the person used the phone between calls (tapped, scrolled, switched apps), the next action
   notices (one 0.16 s fingerprint on a Pixel 7a) and works from the real screen: a ref still on
   it is used where it is now; a ref that is gone is refused with the current screen and the way

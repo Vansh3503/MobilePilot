@@ -63,6 +63,9 @@ _PERMISSION_PACKAGES = {"com.google.android.permissioncontroller", "com.android.
 SYSTEM_DIALOG_PACKAGES = _PERMISSION_PACKAGES | {"android", _SYSTEM_UI}
 """Foreground packages whose windows ask the person something (permissions, choosers, crashes)."""
 _DIALOG_IDS = ("alertTitle", "parentPanel", "buttonPanel", "button1", "button2")
+_DIALOG_BUTTON_ID = re.compile(r"(ok|cancel|positive|negative|confirm|dismiss)_?button", re.I)
+_DIALOG_BUTTONS = {"ok", "cancel", "done", "discard", "keep", "delete", "allow", "don't allow", "not now"}
+"""A Material time/date picker has none of AlertDialog's ids; its Cancel/OK pair names it."""
 _CRASH_WORDS = ("isn't responding", "keeps stopping", "has stopped")
 _SLIDER_ID = re.compile(r"(slider|seek)", re.I)
 """Android 17's volume sliders are an empty ``slider_frame`` with nothing inside in the tree
@@ -89,6 +92,12 @@ def _node(el: ET.Element, parent_role: str | None) -> RawNode:
         role = "AXSlider"
     clickable = _flag(a, "clickable") or _flag(a, "long-clickable")
     text, desc, hint = a.get("text") or None, a.get("content-desc") or None, a.get("hint") or None
+    if role == "AXUnknown" and not clickable and desc and not text:
+        # Jetpack Compose puts a view's text in its content-desc (Play Store's result rows,
+        # Pixel 7a 2026-11-04): as static text it names the button around it.
+        role, text = "AXStaticText", desc
+    if a.get("resource-id", "").endswith("/touch_outside") and not desc:
+        desc = "Outside the sheet (closes it)"
     if clickable and role in _PASSIVE_IF_CLICKABLE:
         role = "AXRow" if parent_role == "AXList" else "AXButton"
     elif role == "AXButton" and not clickable:
@@ -180,6 +189,7 @@ def parse_hierarchy(
         size = (int(max((f.x + f.w for f in frames), default=0)), int(max((f.y + f.h for f in frames), default=0)))
     screen = Rect(0, 0, size[0], size[1])
     overlays = _overlays(windows, nodes, package, screen)
+    empty_web = any(n.role == "AXWebArea" and not n.children for n in nodes for n in n.walk())
     title = activity or package
     root = RawNode(role="AXApplication", title=package, frame=screen, children=nodes)
     return RawTree(
@@ -191,6 +201,7 @@ def parse_hierarchy(
         keyboard=keyboard,
         keyboard_frame=keyboard_frame,
         overlays=overlays,
+        empty_web=empty_web,
     )
 
 
@@ -202,6 +213,11 @@ def _overlays(windows: list[ET.Element], nodes: list[RawNode], package: str, scr
 
     own = [n for w, n in zip(windows, nodes, strict=True) if w.get("package") == package]
     main = None if package in SYSTEM_DIALOG_PACKAGES or not own else max(own, key=area)
+    sheet_ids = ("touch_outside", "design_bottom_sheet")
+    if main is not None and any(x.identifier and x.identifier.rpartition("/")[2] in sheet_ids for x in main.walk()):
+        # a BottomSheetDialog's window fills the screen behind a dimmed touch_outside backdrop
+        # (Amazon's location sheet, Photos' backup sheet; Pixel 7a 2026-11-04)
+        main = None
     if main is not None and area(main) < 0.8 * screen.area:
         # Android 17 dumps only the focused window: with a menu open, the menu is the app's only
         # window and the screen under it is missing (Pixel 7a, Clock's overflow, 2026-11-04).
@@ -216,6 +232,8 @@ def _overlays(windows: list[ET.Element], nodes: list[RawNode], package: str, scr
         f = n.frame
         if pkg in _PERMISSION_PACKAGES:
             kind = "permission dialog"
+        elif pkg == _SYSTEM_UI:
+            kind = "notification shade"  # pulled down on purpose (mobile_key notifications), not a question
         elif pkg == "android" and any(word in words for word in _CRASH_WORDS):
             kind = "crash/ANR dialog"
         elif pkg != package or pkg in SYSTEM_DIALOG_PACKAGES:
@@ -223,7 +241,8 @@ def _overlays(windows: list[ET.Element], nodes: list[RawNode], package: str, scr
         elif any("bottom_sheet" in i for i in ids) or (
                 f is not None and f.y + f.h >= screen.h - 2 and f.w >= screen.w - 2 and f.h < screen.h * 0.9):
             kind = "bottom sheet"
-        elif any(i in _DIALOG_IDS for i in ids):
+        elif any(i in _DIALOG_IDS or _DIALOG_BUTTON_ID.search(i) for i in ids) or _DIALOG_BUTTONS & {
+                (e.get("text") or "").strip().casefold() for e in w.iter("node") if e.get("class", "").endswith("Button")}:
             kind = "dialog"
         elif any(e.get("class", "").rpartition(".")[2] in ("ListView", "RecyclerView") for e in w.iter("node")):
             kind = "popup menu"
@@ -385,6 +404,12 @@ class AndroidEngine(Engine):
     def swipe(self, x1: float, y1: float, x2: float, y2: float, *, duration_s: float = 0.3) -> None:
         self._call(self._d.swipe, x1, y1, x2, y2, duration_s)
 
+    def pixels(self) -> int | None:
+        image = self._call(self._d.screenshot).convert("L")
+        w, h = image.size
+        small = image.crop((0, h // 20, w, h)).resize((36, 80))  # no status bar: its clock ticks
+        return zlib.crc32(bytes(v >> 5 for v in small.tobytes()))  # coarse: compression noise is not a change
+
     def double_tap(self, x: float, y: float) -> None:
         self._call(self._d.double_click, x, y)
 
@@ -392,7 +417,8 @@ class AndroidEngine(Engine):
              duration_s: float = 0.8) -> None:
         # u2's own drag never holds first, and Android only starts a drag-and-drop (list
         # reordering, launcher icons) after a long press; sliders and maps follow either way.
-        touch, steps = self._d.touch, max(5, int(duration_s / 0.02))
+        # each move is one RPC (~50 ms on a Pixel 7a): one per 50 ms, not per 20 ms (a 0.8 s drag took 6 s)
+        touch, steps = self._d.touch, max(5, int(duration_s / 0.05))
         self._call(touch.down, x1, y1)
         try:
             time.sleep(hold_s)
@@ -418,11 +444,24 @@ class AndroidEngine(Engine):
                 return self._call(self._d.freeze_rotation, False)
             for key, value in zip(keys, saved):
                 self._call(self._d.shell, ["settings", "put", "system", key, value])
+            if saved[0] == "0" and saved[1].isdigit():  # a fixed rotation: wait until it is on screen
+                self._wait_rotation(int(saved[1]) % 2 == 1)
             return None
         if getattr(self, "_rotation", None) is None:
             self._rotation = tuple(self._call(self._d.shell, ["settings", "get", "system", k]).output.strip()
                                    for k in keys)
         self._call(self._d.set_orientation, "natural" if orientation == "portrait" else "left")
+        self._wait_rotation(orientation == "landscape")
+
+    def _wait_rotation(self, landscape: bool, timeout_s: float = 4.0) -> None:
+        """Rotation finishes after the call returns; a dump taken in between still shows the old
+        layout (Pixel 7a, Calculator, 2026-11-04). Wait until the dump reports the new one."""
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            m = re.search(r'<hierarchy rotation="(\d)"', self._call(self._d.dump_hierarchy))
+            if m and (int(m.group(1)) % 2 == 1) == landscape:
+                return
+            time.sleep(0.15)
 
     def press_key(self, key: str) -> None:
         if key == "notifications":

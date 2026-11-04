@@ -237,7 +237,8 @@ def test_a_shared_resource_id_is_not_reported_as_the_same_switch(tmp_path):
     ])
     diff = _text(out[2])
     assert "~ " not in diff
-    assert "- switch" in diff and re.search(r"^\+ e\d+ switch  checked", diff, re.M)
+    # the old switch left (counted in the collapsed removed line), a new one arrived
+    assert re.search(r"^- \d+ elements gone", diff, re.M) and re.search(r"^\+ e\d+ switch  checked", diff, re.M), diff
 
 
 def test_find_locate_and_filter(tmp_path):

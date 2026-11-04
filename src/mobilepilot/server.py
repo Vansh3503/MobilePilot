@@ -40,7 +40,7 @@ from mobilepilot.engine.base import KEYS, Device, Engine
 from mobilepilot.errors import ErrorCode, MobilePilotError
 from mobilepilot.models import RawNode, RawTree
 from mobilepilot.perception.diff import diff_snapshots, element_changes
-from mobilepilot.perception.format import format_diff, format_element_line, format_snapshot
+from mobilepilot.perception.format import format_diff, format_element_line, format_snapshot, quote
 from mobilepilot.perception.locators import format_locate
 from mobilepilot.perception.model import Element, Snapshot, SnapshotMode
 from mobilepilot.perception.refs import HISTORY_LIMIT, carry_refs
@@ -55,6 +55,8 @@ SETTLE_S: dict[str, float] = {"launch": 10.0, "type": 1.5, "swipe": 2.0, "drag":
 """How long each action waits for the screen to stop changing before reporting what it shows
 (anything else: :data:`DEFAULT_SETTLE_S`). A cold app start needs far longer than a keystroke."""
 DEFAULT_SETTLE_S = 3.0
+REMOVED_SHOWN = 6
+"""More removed elements than this collapse into one line."""
 POLL_S = 0.15
 FIRST_LOOK_S = 0.5
 """Measured on the API 34 emulator: two dumps 150 ms apart can agree in the middle of a screen
@@ -107,6 +109,10 @@ def _matches(node: RawNode | Element, needle: str) -> bool:
     return any(t and needle in t.casefold() for t in texts)
 
 
+_EMPTY_WEB = ("the web page's content is not in the accessibility tree right now (Chrome drops it after a "
+              "scroll): its effect cannot be read from the tree. Check with mobile_screenshot(show=true), or "
+              "annotate=true to tap by pixels.")
+_TEXT_ROLES = {"AXTextField", "AXTextArea", "AXSearchField", "AXComboBox"}
 _ASK_PERSON = ("Do not answer it yourself: tell the person what it asks and wait for their choice. "
                "Their answer may be to tap one of these.")
 
@@ -252,12 +258,20 @@ class Session:
         where = ""
         if fresh.app.name != before.app.name:
             where = f" Now in {fresh.app.name}, not {before.app.name}: mobile_app launch or mobile_key back returns."
+        now = fresh.element(target.ref) if target is not None else None
         if target is not None and fresh.element(target.ref) is None:
             raise MobilePilotError(
                 ErrorCode.STALE_REF, f"The screen changed since your last result (someone may be using the phone) and "
                 f"{target.ref} is not on it.{where} Nothing was done. The current screen:\n{format_snapshot(fresh)}",
                 hint="Get back to the step's screen, or act on a ref from this one.")
-        return fresh, "the screen had changed since the last result (someone may have used the phone): acted on it as it is now." + where
+        # Apps also change on their own (a map loading, a live score): say so only when it matters.
+        if where:
+            return fresh, "the app changed since the last result (someone may have used the phone):" + where
+        if now is not None and target.center is not None and now.center is not None and (
+                abs(now.center.x - target.center.x) > 4 or abs(now.center.y - target.center.y) > 4):
+            return fresh, (f"{target.ref} had moved since the last result (the screen scrolled or changed): "
+                           "acted on it where it is now")
+        return fresh, None
 
     def _now(self, el: Element | None) -> Element | None:
         """``el`` as the latest snapshot shows it (after a rebase it may have moved)."""
@@ -358,6 +372,7 @@ class Session:
         engine = self._engine()
         woke = self._awake(engine)
         before, moved = self._rebase(engine, before, target)
+        picture = engine.pixels() if action in ("drag", "pinch", "swipe") else None
         summary = do(engine)
         self._last_action = time.monotonic()
         cap = self._cap(action)
@@ -385,8 +400,25 @@ class Session:
                     # the screen under a menu or dialog is hidden, not gone: one line, not one per row
                     extra.append(f"- {len(removed)} elements of the screen behind it (they return when it closes)")
                     removed = []
+                if len(removed) > REMOVED_SHOWN:
+                    # what left the screen matters less than what arrived: a count and a few names
+                    names = [quote(el.name, 40) for el in removed if el.name][:3]
+                    extra.append(f"- {len(removed)} elements gone" + (", e.g. " + ", ".join(names) if names else ""))
+                    removed = []
                 diff = dataclasses.replace(diff, added=added, removed=removed)
-                if diff.is_empty() and not opened:
+                old_f, new_f = before.window.frame if before.window else None, after.window.frame if after.window else None
+                if old_f is not None and new_f is not None and (round(old_f.w), round(old_f.h)) != (round(new_f.w), round(new_f.h)):
+                    # a diff compares names and states, not positions: without this a rotation reads as "nothing"
+                    shape = "landscape" if new_f.w > new_f.h else "portrait"
+                    extra.append(f"screen is now {round(new_f.w)}×{round(new_f.h)} ({shape}): every position moved, "
+                                 "refs are unchanged (the next result uses the new positions)")
+                redrawn = diff.is_empty() and picture is not None and engine.pixels() != picture
+                if diff.is_empty() and not opened and not extra and redrawn:
+                    lines.append("the tree did not change, but the picture did (a map, canvas, game or web page "
+                                 f"draws without it): pass screenshot=true to see the result\n(snapshot {after.snapshot_id})")
+                elif diff.is_empty() and not opened and not extra and tree.empty_web:
+                    lines.append(f"no change in the tree, but {_EMPTY_WEB}\n(snapshot {after.snapshot_id})")
+                elif diff.is_empty() and not opened and not extra:
                     hint = (" It has no name: check it is the control you meant with "
                             "mobile_screenshot(annotate=true, show=true)." if target is not None and not target.name else "")
                     lines.append("no visible change — the action did nothing on screen." + hint
@@ -401,6 +433,8 @@ class Session:
                 if diff.app_changed and "launcher" in (after.app.name or ""):
                     lines.append(f"the app left the foreground: the home screen is showing ({after.app.name})")
             lines.extend(opened)
+            if any(n.role == "AXProgressIndicator" and n.visible for n in tree.root.walk()):
+                lines.append("a loading indicator is showing: content may still be arriving (mobile_wait_for until=idle, or for its text)")
             if tree.keyboard and not (old_tree is not None and old_tree.keyboard):
                 lines.append("opened: keyboard (mobile_key back hides it on Android)")
             elif tree.keyboard:
@@ -553,6 +587,11 @@ class Session:
         before, target = (self._on_screen(ref) if ref else (self.store.latest(), None))
         if target is None and before is not None:
             target = before.focused_element
+            if target is None and not any(el.ax_role in _TEXT_ROLES for el in before.all_elements):
+                # `input text` with nothing focused goes nowhere, and the result would claim it typed
+                # (Clock's timer: its digits are buttons; Pixel 7a, 2026-11-04)
+                raise MobilePilotError(ErrorCode.ELEMENT_NOT_FOUND, "This screen has no text field to type into.",
+                                       hint="Tap the on-screen buttons instead (a keypad, a picker), or open the field first.")
         if target is not None and target.secure and not secret:
             raise MobilePilotError(
                 ErrorCode.INVALID_ARGUMENT, f"{target.ref} is a password field.",
@@ -567,7 +606,7 @@ class Session:
             if submit:
                 engine.press_key("enter")
             shown = "•" * len(text) if secret or (target is not None and target.secure) else repr(text)
-            where = f" into {format_element_line(target)}" if target is not None else ""
+            where = f" into {target.ref} {target.role}" + (f" {quote(target.name)}" if target.name else "") if target is not None else ""
             return f"typed {shown}{where}" + (" and pressed enter" if submit else "")
 
         return await self.act(do, report=report, screenshot=screenshot, action="type", before=before, target=target)
@@ -717,13 +756,18 @@ class Session:
             if not scroll or not scrollers or scrolls >= max_scrolls:
                 why = "no scrollable list on screen" if scroll and not scrollers else (
                     f"gave up after {scrolls} scrolls" if scroll else "scroll=false")
-                raise MobilePilotError(ErrorCode.ELEMENT_NOT_FOUND, f"Nothing matching {needle!r} is on screen ({why}).")
+                raise MobilePilotError(ErrorCode.ELEMENT_NOT_FOUND, f"Nothing matching {needle!r} is on screen ({why})."
+                                       + (f" Also, {_EMPTY_WEB}" if tree.empty_web else "")
+                                       + ("".join(f" A {o.kind} is open over the app: deal with it first."
+                                                  for o in tree.overlays[:1])))
             box = max(scrollers, key=lambda el: el.frame.area).frame
             before_sig = engine.signature()
             engine.swipe(box.x + box.w / 2, box.y + box.h * 0.75, box.x + box.w / 2, box.y + box.h * 0.25)
             scrolls += 1
             self._settle(engine, self._cap("swipe"))
             if engine.signature() == before_sig:
+                if tree.empty_web or engine.capture_tree().empty_web:
+                    raise MobilePilotError(ErrorCode.ELEMENT_NOT_FOUND, f"Nothing matching {needle!r} in the tree, and {_EMPTY_WEB}")
                 raise MobilePilotError(ErrorCode.ELEMENT_NOT_FOUND,
                                        f"Nothing matching {needle!r}: scrolled to the end of the list ({scrolls} scrolls).",
                                        hint="It may be above: mobile_swipe direction=up, then mobile_find again.")

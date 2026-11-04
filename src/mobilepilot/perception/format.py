@@ -148,8 +148,9 @@ def _footer(snap: Snapshot) -> str:
     text += f", offset {snap.offset})." if snap.offset else ")."
     if snap.next_offset is not None:
         text += f" More: offset={snap.next_offset}."
-    if snap.total == 0 and snap.mode == "interactive":
-        text += (' Nothing actionable found: this screen may have no accessibility tree (a game, Flutter, a canvas'
+    if snap.mode == "interactive" and (snap.total == 0 or (
+            snap.total <= 2 and not any(el.name for el in snap.all_elements))):  # a dialog's named buttons are fine
+        text += (' Little or nothing in the tree: if the screen shows more, it is drawn without accessibility (a game, Flutter, a canvas'
                  ' or a thin web view). Try mode="full"; else mobile_screenshot(annotate=true, show=true) and tap'
                  ' its pixels with coordinate_space="screenshot".')
     if snap.truncated:

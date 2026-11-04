@@ -28,6 +28,10 @@ class FakeEngine(Engine):
         self.package = package
         self.log: list[str] = []
         self.shot_size = (320, 640)
+        self.size = (320, 640)
+        self.picture: int | None = None
+        """What ``pixels`` returns; drag and pinch change it (a map moving). None: no pixels."""
+        """Screen size ``capture_tree`` reports; ``rotate`` swaps it."""
         """Size of the PNG ``screenshot`` writes (smaller than the screen to test scaling)."""
         self.typed: list[str] = []
 
@@ -35,10 +39,10 @@ class FakeEngine(Engine):
         self.last_fingerprint = self.signature()
         return parse_hierarchy(self.screens[self.current], package=self.package,
                                activity=self.activities.get(self.current, self.current),
-                               pid=4242, size=(320, 640))
+                               pid=4242, size=self.size)
 
     def signature(self) -> int:
-        return hash(self.current)
+        return hash(self.screens[self.current])  # the content, as the device's dump fingerprint is
 
     def _labels(self, node: RawNode) -> set[str]:
         """A node's own labels and its descendants' (a row is tapped through its title text)."""
@@ -69,12 +73,19 @@ class FakeEngine(Engine):
     def drag(self, x1: float, y1: float, x2: float, y2: float, *, hold_s: float = 0.6,
              duration_s: float = 0.8) -> None:
         self.log.append(f"drag {x1:g},{y1:g}->{x2:g},{y2:g} hold {hold_s:g}s")
+        if self.picture is not None:
+            self.picture += 1
 
     def pinch(self, cx: float, cy: float, spread: float, *, zoom: str) -> None:
         self.log.append(f"pinch {zoom} at {cx:g},{cy:g} spread {spread:g}")
 
+    def pixels(self) -> int | None:
+        return self.picture
+
     def rotate(self, orientation: str) -> None:
         self.log.append(f"rotate {orientation}")
+        w, h = sorted(self.size)
+        self.size = (h, w) if orientation == "landscape" else (w, h)
 
     def swipe(self, x1: float, y1: float, x2: float, y2: float, *, duration_s: float = 0.3) -> None:
         self.log.append(f"swipe {x1:g},{y1:g}->{x2:g},{y2:g} in {duration_s:g}s")
