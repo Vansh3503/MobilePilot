@@ -3,6 +3,8 @@ the device guards: synthetic two-window dumps through the real parser, perceptio
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from PIL import Image
 
@@ -300,7 +302,7 @@ def test_an_empty_web_view_is_not_reported_as_nothing_happening(tmp_path):
     out = _Driver(build_server(session)).run([("mobile_snapshot", {}), ("mobile_swipe", {"direction": "down"}),
                                               ("mobile_find", {"text": "History"})])
     assert "no visible change" not in _text(out[1]) and "not in the accessibility tree" in _text(out[1])
-    assert out[2].is_error and "Chrome drops it" in _text(out[2]) and "end of the list" not in _text(out[2])
+    assert out[2].is_error and "Chrome drops it at times" in _text(out[2]) and "end of the list" not in _text(out[2])
 
 
 def test_many_removed_rows_collapse_and_few_stay_listed(tmp_path):
@@ -390,3 +392,93 @@ def test_a_full_screen_bottom_sheet_dialog_is_a_sheet():
     tree = parse_hierarchy(dump(sheet), package=PKG, size=(1080, 2400))
     assert [o.kind for o in tree.overlays] == ["bottom sheet"]
     assert any(n.description == "Outside the sheet (closes it)" for n in tree.root.walk())
+
+
+def test_a_compose_sheet_in_the_apps_own_window_is_a_sheet(tmp_path):
+    # Material3 ModalBottomSheet: its window is the app's and fills the screen behind a "Close sheet"
+    # scrim (Photos' backup sheet, Pixel 7a 2026-11-04)
+    compose = node("FrameLayout", "[0,0][320,640]", children=(
+        node("View", "[0,0][320,640]", desc="Close sheet", clickable=True)
+        + node("View", "[0,380][320,640]", children=node("Button", "[16,560][304,608]", text="Turn on backup",
+                                                         clickable=True))))
+    tree = parse_hierarchy(dump(compose), package=PKG, size=(320, 640))
+    assert [o.kind for o in tree.overlays] == ["bottom sheet"]
+    SCREENS["compose_sheet"] = dump(compose)
+    driver, _, _ = _driver(tmp_path, taps={("main", "Save"): "compose_sheet"})
+    out = driver.run([("mobile_snapshot", {}), ("mobile_tap", lambda out: {"ref": _ref(_text(out[0]), '"Save"')})])
+    assert "opened: bottom sheet (2 items)" in _text(out[1]), _text(out[1])
+
+
+def test_a_permission_prompt_lists_its_buttons_not_their_containers(tmp_path):
+    pc = "com.google.android.permissioncontroller"
+    question = "Allow Contacts to send you notifications?"
+    buttons = (node("Button", "[16,300][304,340]", text="Allow", rid=f"{pc}:id/permission_allow_button",
+                    clickable=True, pkg=pc)
+               + node("Button", "[16,360][304,400]", text="Don't allow", rid=f"{pc}:id/permission_deny_button",
+                      clickable=True, pkg=pc))
+    # as Android 17 dumps it: both wrappers are clickable and carry the question as their description
+    prompt = node("FrameLayout", "[0,200][320,440]", rid=f"{pc}:id/grant_singleton", desc=question, clickable=True,
+                  pkg=pc, children=node("LinearLayout", "[8,208][312,432]", rid=f"{pc}:id/grant_dialog", desc=question,
+                                        clickable=True, pkg=pc, children=(
+                                            node("TextView", "[16,220][304,260]", text=question, pkg=pc) + buttons)))
+    SCREENS["prompt"] = dump(prompt)
+    driver, engine, _ = _driver(tmp_path, taps={("main", "Save"): "prompt"})
+    engine.package = pc
+    out = driver.run([("mobile_snapshot", {}), ("mobile_tap", lambda out: {"ref": _ref(_text(out[0]), '"Save"')})])
+    text = _text(out[1])
+    assert "opened: permission dialog (2 items)" in text and '"Allow"' in text and "Don't allow" in text, text
+    assert "grant_" not in text.split("opened:")[1], text
+
+
+def test_the_diff_header_leaves_out_zero_counts():
+    from mobilepilot.perception.diff import diff_snapshots
+    from mobilepilot.perception.format import format_diff
+    from mobilepilot.perception.snapshot import build_snapshot
+
+    def snap(xml, sid):
+        return build_snapshot(parse_hierarchy(xml, package=PKG, size=(320, 640)), snapshot_id=sid)
+
+    plain = dump(MAIN)
+    focused = plain.replace(f'resource-id="{PKG}:id/note"', f'resource-id="{PKG}:id/note" focused="true"')
+    text = format_diff(diff_snapshots(snap(plain, "s1"), snap(focused, "s2")))
+    assert text.splitlines()[0] == "Changes since s1 (now s2)" and "0 " not in text, text
+    added = dump(node("FrameLayout", "[0,0][320,640]", children=MAIN[MAIN.index(">") + 1:-len("</node>")]
+                      + node("Button", "[16,460][304,500]", text="Undo", clickable=True)))
+    assert format_diff(diff_snapshots(snap(plain, "s1"), snap(added, "s3"))).splitlines()[0].endswith(": 1 added")
+
+
+def test_a_spinner_after_settling_gets_one_more_wait_for_the_results(tmp_path):
+    loading = dump(node("FrameLayout", "[0,0][320,640]", children=node("ProgressBar", "[140,300][180,340]")))
+    results = dump(node("FrameLayout", "[0,0][320,640]", children=node("TextView", "[0,100][320,160]",
+                                                                      text="12 results", clickable=True)))
+    SCREENS.update(loading=loading, results=results)
+    driver, engine, session = _driver(tmp_path, taps={("main", "Save"): "loading"})
+    session.settle_s = 2.0
+    real, shown = engine.signature, []
+
+    def signature():
+        if engine.current == "loading":
+            shown.append(time.monotonic())
+            if time.monotonic() - shown[0] > 0.3:
+                engine.current = "results"  # the results arrive while the spinner turns
+        return real()
+
+    engine.signature = signature
+    out = driver.run([("mobile_snapshot", {}), ("mobile_tap", lambda out: {"ref": _ref(_text(out[0]), '"Save"')})])
+    text = _text(out[1])
+    assert '"12 results"' in text and "loading indicator" not in text, text
+
+
+def test_a_page_whose_tree_empties_says_so_even_when_other_rows_changed(tmp_path):
+    full = dump(node("FrameLayout", "[0,0][320,640]", children=(
+        node("Button", "[0,0][320,40]", text="Tabs", clickable=True)
+        + node("WebView", "[0,40][320,640]", children=node("Button", "[0,100][320,140]", text="Search", clickable=True)))))
+    empty = dump(node("FrameLayout", "[0,0][320,640]", children=node("WebView", "[0,0][320,640]")))
+    engine = FakeEngine({"full": full, "empty": empty}, "full", package=PKG, activities={"full": ".M", "empty": ".M"})
+    session = Session(list_devices=lambda: [PHONE], connect=lambda d: engine, screenshots_dir=tmp_path,
+                      poll_s=0, first_look_s=0, settle_s=0.05)
+    engine.swipe = lambda *a, **k: setattr(engine, "current", "empty")  # the toolbar hides and the page empties
+    out = _Driver(build_server(session)).run([("mobile_snapshot", {}), ("mobile_swipe", {"direction": "down"})])
+    text = _text(out[1])
+    assert "gone" in text or "- " in text, text
+    assert "note: the web page's content is not in the accessibility tree" in text, text

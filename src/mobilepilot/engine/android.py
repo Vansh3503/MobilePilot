@@ -205,6 +205,11 @@ def parse_hierarchy(
     )
 
 
+def _compose_scrim(node: RawNode) -> bool:
+    # ponytail: Material3's English label; other locales fall back to the geometry checks below
+    return node.description == "Close sheet" and "tap" in node.actions
+
+
 def _overlays(windows: list[ET.Element], nodes: list[RawNode], package: str, screen: Rect) -> list[Overlay]:
     """Every window except the app's main one (its largest own window), named by what it is.
     A system dialog in the foreground (a permission prompt is its own activity) counts whole."""
@@ -214,9 +219,11 @@ def _overlays(windows: list[ET.Element], nodes: list[RawNode], package: str, scr
     own = [n for w, n in zip(windows, nodes, strict=True) if w.get("package") == package]
     main = None if package in SYSTEM_DIALOG_PACKAGES or not own else max(own, key=area)
     sheet_ids = ("touch_outside", "design_bottom_sheet")
-    if main is not None and any(x.identifier and x.identifier.rpartition("/")[2] in sheet_ids for x in main.walk()):
+    if main is not None and any(_compose_scrim(x) or (x.identifier and x.identifier.rpartition("/")[2] in sheet_ids)
+                                for x in main.walk()):
         # a BottomSheetDialog's window fills the screen behind a dimmed touch_outside backdrop
-        # (Amazon's location sheet, Photos' backup sheet; Pixel 7a 2026-11-04)
+        # (Amazon's location sheet; Pixel 7a 2026-11-04); a Compose ModalBottomSheet's behind a
+        # "Close sheet" scrim (Photos' backup sheet)
         main = None
     if main is not None and area(main) < 0.8 * screen.area:
         # Android 17 dumps only the focused window: with a menu open, the menu is the app's only
@@ -238,7 +245,7 @@ def _overlays(windows: list[ET.Element], nodes: list[RawNode], package: str, scr
             kind = "crash/ANR dialog"
         elif pkg != package or pkg in SYSTEM_DIALOG_PACKAGES:
             kind = "system dialog"
-        elif any("bottom_sheet" in i for i in ids) or (
+        elif any("bottom_sheet" in i for i in ids) or any(_compose_scrim(x) for x in n.walk()) or (
                 f is not None and f.y + f.h >= screen.h - 2 and f.w >= screen.w - 2 and f.h < screen.h * 0.9):
             kind = "bottom sheet"
         elif any(i in _DIALOG_IDS or _DIALOG_BUTTON_ID.search(i) for i in ids) or _DIALOG_BUTTONS & {

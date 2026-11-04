@@ -109,12 +109,24 @@ def _matches(node: RawNode | Element, needle: str) -> bool:
     return any(t and needle in t.casefold() for t in texts)
 
 
-_EMPTY_WEB = ("the web page's content is not in the accessibility tree right now (Chrome drops it after a "
-              "scroll): its effect cannot be read from the tree. Check with mobile_screenshot(show=true), or "
-              "annotate=true to tap by pixels.")
+# Pixel 7a 2026-11-04: Chrome emptied a long article's tree after a scroll on one run and kept it on the
+# next; a reload also left it empty, a back-navigation once refilled it. No action refills it reliably.
+_EMPTY_WEB = ("the web page's content is not in the accessibility tree right now (Chrome drops it at times, "
+              "often after a scroll or reload): its effect cannot be read from the tree. Check with "
+              "mobile_screenshot(show=true), or annotate=true to tap by pixels.")
 _TEXT_ROLES = {"AXTextField", "AXTextArea", "AXSearchField", "AXComboBox"}
 _ASK_PERSON = ("Do not answer it yourself: tell the person what it asks and wait for their choice. "
                "Their answer may be to tap one of these.")
+
+
+def _loading(tree: RawTree) -> bool:
+    return any(n.role == "AXProgressIndicator" and n.visible for n in tree.root.walk())
+
+
+def _inside(inner: Element, outer: Element) -> bool:
+    a, b = inner.frame, outer.frame
+    return (inner is not outer and a is not None and b is not None and a.x >= b.x and a.y >= b.y
+            and a.x + a.w <= b.x + b.w and a.y + a.h <= b.y + b.h)
 
 
 def _opened(before: RawTree | None, after: RawTree, snap: Snapshot,
@@ -135,6 +147,9 @@ def _opened(before: RawTree | None, after: RawTree, snap: Snapshot,
         if key(o) in old:
             continue
         items = [el for el in snap.all_elements if el.handle in o.handles and el.interactive]
+        # a clickable container around two or more of them (a permission prompt's grant_dialog,
+        # named like its question) is not an option to pick
+        items = [el for el in items if sum(_inside(other, el) for other in items) < 2]
         kind = o.kind
         if kind == "popup menu" and target is not None and target.ax_role == "AXPopUpButton":
             kind = "drop-down list"
@@ -380,6 +395,17 @@ class Session:
         lines = [f"({note})" for note in (woke, moved) if note] + [summary]
         if report != "none":
             tree = engine.capture_tree()
+            left = cap - (time.monotonic() - self._last_action)
+            if _loading(tree) and left > self.poll_s:
+                # a spinner keeps the dump still, so it "settles" before the results arrive (YouTube
+                # and Amazon search, Pixel 7a 2026-11-04): wait once for the screen to change
+                still, deadline = engine.signature(), time.monotonic() + left
+                while time.monotonic() < deadline:
+                    time.sleep(self.poll_s)
+                    if engine.signature() != still:
+                        settled = self._settle(engine, max(deadline - time.monotonic(), 0.0))
+                        tree = engine.capture_tree()
+                        break
             mode = before.mode if before is not None else "interactive"
             old_tree = self.trees.get(before.snapshot_id) if before is not None else None
             after = self._build(tree, mode=mode, previous=before)
@@ -430,10 +456,12 @@ class Session:
                     lines.append(format_diff(diff))
                     lines.extend(extra)
                     lines.append(f"(snapshot {after.snapshot_id})")
+                if tree.empty_web and not any(_EMPTY_WEB in line for line in lines):
+                    lines.append(f"note: {_EMPTY_WEB}")  # also when other rows changed: they hide that the page went
                 if diff.app_changed and "launcher" in (after.app.name or ""):
                     lines.append(f"the app left the foreground: the home screen is showing ({after.app.name})")
             lines.extend(opened)
-            if any(n.role == "AXProgressIndicator" and n.visible for n in tree.root.walk()):
+            if _loading(tree):
                 lines.append("a loading indicator is showing: content may still be arriving (mobile_wait_for until=idle, or for its text)")
             if tree.keyboard and not (old_tree is not None and old_tree.keyboard):
                 lines.append("opened: keyboard (mobile_key back hides it on Android)")

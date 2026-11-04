@@ -272,10 +272,10 @@ def format_diff(diff: SnapshotDiff, max_items: int = 30) -> str:
     else:
         removed = ["- " + _label(el, with_ref=False) for el in diff.removed]
     changed = _change_lines(diff, hide_focus=focus_moved)
-    lines = [
-        f"Changes since {diff.before_id} (now {diff.after_id}): "
-        f"{len(added)} added, {len(diff.removed)} removed, {len(changed)} changed"
-    ]
+    # only counts that are not zero: "0 added, 0 removed, 0 changed" after a focus move says nothing
+    counts = ", ".join(f"{n} {what}" for n, what in ((len(added), "added"), (len(diff.removed), "removed"),
+                                                      (len(changed), "changed")) if n)
+    lines = [f"Changes since {diff.before_id} (now {diff.after_id})" + (f": {counts}" if counts else "")]
     if diff.app_changed:
         lines.append(f"app: {diff.app_before or '?'} → {diff.app_after or '?'}")
     if diff.window_changed:
