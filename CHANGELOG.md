@@ -5,6 +5,13 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- The recorder fails closed where it used to fail open:
+  - When Android says the keyboard is up but not where, the lower half of the screen is treated as keys, and those touches are not stored. A touch before the first screen reading keeps no position.
+  - A field stays secret for the rest of the recording once it has reported itself as a password field, or once its id, hint or label names a password, PIN, OTP or CVV. A later reading without the password flag is never taken as typed data. Changes to such a field are noticed through a hash, not stored.
+  - A PIN pad is recognised without a focused password field: a 0-9 grid with no calculator keys, or a screen that asks for a PIN or passcode. Its keys, and taps on nothing there, are redacted, and no screenshot is taken right after. A calculator, including Google Calculator's word-named keys, still records.
+
 ### Changed
 
 - Found replaying a recorded Amazon flow on a Pixel 7a (2026-11-17):

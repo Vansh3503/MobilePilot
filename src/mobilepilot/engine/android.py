@@ -263,6 +263,10 @@ def _overlays(windows: list[ET.Element], nodes: list[RawNode], package: str, scr
 _TICKING = re.compile(r'(?:text|content-desc)="[^"]*\d[^"]*"')
 
 
+def ime_visible(out: str) -> bool:
+    return "isVisible=true" in out
+
+
 def ime_frame(out: str) -> Rect | None:
     """The keyboard's area from ``dumpsys window InputMethod``: the IME window's frame minus its
     content inset (the window spans the screen; only the part below the inset is keys)."""
@@ -464,7 +468,8 @@ class AndroidEngine(Engine):
         tree = self._tree(xml, current)
         keyboard = tree.keyboard_frame if tree.keyboard else ime_frame(out)
         locked = "isKeyguardShowing=true" in out or ("mWakefulness=" in out and "mWakefulness=Awake" not in out)
-        return Frame(0.0, 0.0, tree, fp, keyboard=keyboard, locked=locked, rotation=rotation)
+        return Frame(0.0, 0.0, tree, fp, keyboard=keyboard, locked=locked, rotation=rotation,
+                     keyboard_unknown=keyboard is None and ime_visible(out))
 
     def signature(self) -> int:
         """A cheap fingerprint of the screen (no app lookup), for waiting until it settles."""

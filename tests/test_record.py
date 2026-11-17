@@ -297,10 +297,12 @@ class Rig:
         self.rec = Recorder(tmp_path / "rec", natural=NATURAL, config=cfg, shoot=shoot, device="emu",
                             clock=lambda: self.now)
 
-    def frame(self, xml, at, *, keyboard=None, locked=False, rotation=0, title="Main", pkg=PKG):
+    def frame(self, xml, at, *, keyboard=None, locked=False, rotation=0, title="Main", pkg=PKG,
+              keyboard_unknown=False):
         self.now = at
         t = parse_hierarchy(xml, package=pkg, activity=title, size=(640, 320) if rotation % 2 else NATURAL)
-        self.rec.frame(Frame(at - 0.05, at, t, fingerprint(xml), keyboard=keyboard, locked=locked, rotation=rotation))
+        self.rec.frame(Frame(at - 0.05, at, t, fingerprint(xml), keyboard=keyboard, locked=locked, rotation=rotation,
+                             keyboard_unknown=keyboard_unknown))
 
     def settle(self, xml, at, **kw):
         self.frame(xml, at, **kw)
@@ -897,3 +899,123 @@ def test_a_launcher_step_tells_the_test_to_start_the_app_by_package(tmp_path):
     loc = wf["steps"][0]["target"]["locator"]
     assert loc == {"strategy": "app", "value": "com.example.shop", "tier": "strong", "unique": True,
                    "note": "start it by package (Appium activate_app); the icon's place on the launcher is not part of the app"}
+
+
+# --------------------------------------------------------------------------- privacy: fail closed
+def _written(r):
+    return (r.rec.folder / "steps.jsonl").read_text() + (r.rec.folder / "workflow.json").read_text()
+
+
+def test_a_keyboard_that_is_up_where_android_does_not_say_still_hides_its_keys(tmp_path):
+    """dumpsys said the keyboard was visible but gave no area: its touches must not be stored."""
+    r = Rig(tmp_path)
+    r.settle(field_screen(""), 1.0, keyboard_unknown=True)
+    for i, (x, y) in enumerate([(30, 450), (90, 520), (200, 600)]):
+        r.tap(x, y, 2.0 + i * 0.2)
+    r.settle(field_screen("Office-5G"), 3.0, keyboard_unknown=True)
+    r.tap(160, 224, 5.0)  # Save, in the top half
+    wf = r.stop()
+    assert [s["action"] for s in wf["steps"]] == ["type", "tap"]
+    for x, y in [(30, 450), (90, 520), (200, 600)]:
+        assert f"[{x}, {y}]" not in _written(r)
+
+
+def test_ime_visible_without_an_area_is_reported_as_unknown():
+    from mobilepilot.engine.android import ime_frame, ime_visible
+
+    out = "mGivenContentInsets=[0,0][0,0]\n frame=[0,24][320,640]\nisVisible=true\n"
+    assert ime_frame(out) is None and ime_visible(out)
+    assert not ime_visible(out.replace("isVisible=true", "isVisible=false"))
+
+
+def test_a_touch_before_the_first_screen_reading_keeps_no_position(tmp_path):
+    r = Rig(tmp_path)
+    r.tap(90, 520, 0.5)
+    r.settle(HOME, 1.0)
+    step = r.stop()["steps"][0]
+    assert step["redacted"] and "at" not in step and "at_pct" not in step
+    assert "[90, 520]" not in _written(r)
+
+
+def _pw_field(value, *, password, rid="name", focused=True):
+    return screen(node("EditText", "[16,100][304,148]", text=value, rid=f"{PKG}:id/{rid}", clickable=True,
+                       focused=focused, password=password)
+                  + node("Button", "[16,200][304,248]", text="Save", clickable=True))
+
+
+def test_a_field_once_seen_as_a_password_stays_secret(tmp_path):
+    """Compose's show-password toggle, or a reading where the flag is missing: the plain value of
+    a field that was a password field must never be taken as typed data."""
+    r = Rig(tmp_path)
+    r.settle(_pw_field("", password=True), 1.0, keyboard=KEYBOARD)
+    r.tap(30, 450, 2.0)
+    r.settle(_pw_field("hunter2", password=False), 2.5, keyboard=KEYBOARD)
+    r.tap(160, 224, 4.0)
+    wf = r.stop()
+    typed = wf["steps"][0]
+    assert typed["data"] == SECRET and typed["secret"] and typed["screenshot"] is None
+    assert "hunter2" not in _written(r)
+
+
+def test_a_field_named_for_a_pin_is_secret_without_the_password_flag(tmp_path):
+    r = Rig(tmp_path)
+    r.settle(_pw_field("", password=False, rid="pin_input"), 1.0, keyboard=KEYBOARD)
+    r.settle(_pw_field("4821", password=False, rid="pin_input"), 2.0, keyboard=KEYBOARD)
+    r.tap(160, 224, 4.0)
+    wf = r.stop()
+    assert wf["steps"][0]["data"] == SECRET and "4821" not in _written(r)
+
+
+def _pad(extra="", digits="1234567890"):
+    keys = "".join(node("Button", f"[{(i % 3) * 100},{300 + (i // 3) * 60}][{(i % 3) * 100 + 100},{360 + (i // 3) * 60}]",
+                        text=d, clickable=True) for i, d in enumerate(digits))
+    return screen(keys + extra)
+
+
+def test_a_digit_pad_with_no_password_field_is_still_a_pin_pad(tmp_path):
+    r = Rig(tmp_path)
+    r.settle(_pad(), 1.0)
+    r.tap(50, 330, 2.0)   # "1"
+    step = r.stop()["steps"][0]
+    assert step["redacted"] and "target" not in step and "at" not in step
+    assert step["screenshot"] is None
+
+
+def test_a_screen_asking_for_a_pin_redacts_short_keys(tmp_path):
+    r = Rig(tmp_path)
+    r.settle(screen(node("TextView", "[0,40][320,80]", text="Enter your PIN")
+                    + node("Button", "[0,300][100,360]", text="7", clickable=True)), 1.0)
+    r.tap(50, 330, 2.0)
+    assert r.stop()["steps"][0]["redacted"]
+
+
+def test_a_calculator_keypad_is_not_a_pin_pad(tmp_path):
+    ops = "".join(node("Button", f"[300,{300 + i * 60}][320,{360 + i * 60}]", text=o, clickable=True)
+                  for i, o in enumerate("+=×"))
+    r = Rig(tmp_path)
+    r.settle(_pad(ops), 1.0)
+    r.tap(50, 330, 2.0)
+    step = r.stop()["steps"][0]
+    assert not step.get("redacted") and step["target"]["name"] == "1"
+
+
+def test_a_prefilled_pin_field_that_nobody_typed_in_is_not_a_step(tmp_path):
+    r = Rig(tmp_path)
+    r.settle(_pw_field("4821", password=False, rid="pin_input"), 1.0)
+    r.settle(_pw_field("4821", password=False, rid="pin_input"), 2.0)
+    r.tap(160, 224, 4.0)
+    wf = r.stop()
+    assert [s["action"] for s in wf["steps"]] == ["tap"] and "4821" not in _written(r)
+
+
+def test_a_calculator_whose_keys_are_named_in_words_is_not_a_pin_pad(tmp_path):
+    """Google Calculator's keys are content-desc only, operators as words (Pixel 7a, 2026-11-17)."""
+    keys = "".join(node("Button", f"[{(i % 3) * 100},{300 + (i // 3) * 60}][{(i % 3) * 100 + 100},{360 + (i // 3) * 60}]",
+                        desc=d, clickable=True) for i, d in enumerate("1234567890"))
+    ops = "".join(node("Button", f"[300,{300 + i * 60}][320,{360 + i * 60}]", desc=o, clickable=True)
+                  for i, o in enumerate(["plus", "equals", "multiply"]))
+    r = Rig(tmp_path)
+    r.settle(screen(keys + ops), 1.0)
+    r.tap(50, 330, 2.0)
+    step = r.stop()["steps"][0]
+    assert not step.get("redacted") and step["target"]["name"] == "1"

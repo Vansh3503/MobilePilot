@@ -386,6 +386,8 @@ class Frame:
     fingerprint: int
     keyboard: Rect | None = None
     """Where the on-screen keyboard is, if it is up."""
+    keyboard_unknown: bool = False
+    """The keyboard is up but Android did not say where: its touches are treated as keys."""
     locked: bool = False
     """The lock screen is showing, or the screen is off: touches are not recorded."""
     rotation: int = 0
@@ -418,6 +420,27 @@ def container_at(snap: Snapshot, x: float, y: float) -> Element | None:
     hits = [el for el in snap.all_elements if "scroll" in el.actions and el.frame is not None
             and el.frame.x <= x < el.frame.x + el.frame.w and el.frame.y <= y < el.frame.y + el.frame.h]
     return min(hits, key=lambda el: el.frame.area) if hits else None
+
+
+def keys_area(frame: Frame, natural: tuple[int, int]) -> Rect | None:
+    """Where touches count as key presses. Fails closed: a keyboard that is up somewhere unknown
+    is taken to fill the lower half of the screen, where every phone keyboard sits."""
+    if frame.keyboard is not None or not frame.keyboard_unknown:
+        return frame.keyboard
+    w, h = display_size(frame.rotation, natural)
+    return Rect(0, h // 2, w, h - h // 2)
+
+
+_SECRET_WORDS = re.compile(r"(?i)(?:^|[^a-z])(password|passwd|passcode|pwd|pin|otp|cvv|cvc)(?:[^a-z]|$)")
+"""A field named for a secret: its id (``pin_input``), hint or label."""
+_PIN_WORDS = re.compile(r"(?i)\b(pin|passcode|pass code)\b")
+_CALC_KEYS = {"+", "=", "×", "÷", "−", "*", "/", "plus", "minus", "multiply", "times", "divide", "equals"}
+"""A keypad with these is a calculator, not a PIN pad. Google Calculator names its keys in words
+(Pixel 7a, 2026-11-17): it was being taken for a PIN pad."""
+
+
+def _clean_text(text: str) -> str:
+    return text.strip()
 
 
 def _inside(rect: Rect | None, x: float, y: float) -> bool:
@@ -522,6 +545,10 @@ class _Field:
     or a miss. Their positions are never kept, so which one it was cannot be told."""
     shot: str | None = None
     shot_value: str | None = None
+    secret: bool = False
+    """Once a password field, always: a reading without the flag (a show-password toggle) is not typed data."""
+    seen: int | None = None
+    """A hash of a secret field's plain text, when a reading shows it: change is noticed, the text is not kept."""
 
 
 class Recorder:
@@ -551,6 +578,7 @@ class Recorder:
         self._fields: dict[tuple, _Field] = {}
         self._focus: tuple | None = None
         self._secret_until = -math.inf
+        self._secret_ids: set[str] = set()
         self._unlock: dict[str, Any] | None = None
         self._down: float | None = None
         self._pinned: tuple[float, Frame | None, bool] | None = None
@@ -632,7 +660,7 @@ class Recorder:
         dx, dy = to_display(x, y, frame.rotation, self.natural)
         # pinned now: by the time the finger lifts (a long drag) this reading may have left the buffer
         self._pinned = (t, frame, x >= 0 and self._sure(frame, dx, dy))
-        if _inside(frame.keyboard, dx, dy):
+        if _inside(keys_area(frame, self.natural), dx, dy):
             return
         self._flush_typing(frame, submitted=False)
         for p in list(self.pending):
@@ -656,7 +684,7 @@ class Recorder:
         if frame is not None and frame.locked:
             self._lock_touch(touch)
             return
-        if frame is not None and _inside(frame.keyboard, x0, y0):
+        if frame is not None and _inside(keys_area(frame, self.natural), x0, y0):
             # never stored: where keys were pressed spells what was typed
             self.keyboard_touches += 1
             if self._focus is not None and self._focus in self._fields:
@@ -664,8 +692,16 @@ class Recorder:
                 fld.keys += 1
                 fld.idle_keys += 1
                 fld.changed_at = touch.end
-                if fld.el.secure:
+                if fld.secret:
                     self._secret_until = touch.end + SECRET_GRACE_S
+            return
+        if frame is None:
+            # nothing read yet: it may have been a key on a keyboard nobody has seen, so no position
+            self.keyboard_touches += 1
+            step = {"action": "tap" if len(touch.fingers) <= 1 else "gesture", "redacted": True, "sure": False,
+                    "note": "before the first screen reading: where it was is not kept (it may have been a key)"}
+            self._last_touch_end = touch.end
+            self._add(step, touch.end, None, None)
             return
         g = classify(touch, self.cfg, rotation, self.natural)
         if frame is not None:
@@ -691,7 +727,7 @@ class Recorder:
                 fld = self._fields[self._focus]
                 fld.keys += 1
                 fld.changed_at = k.end
-                if fld.el.secure:
+                if fld.secret:
                     self._secret_until = k.end + SECRET_GRACE_S
             return
         frame = self._frame_before(k.start)
@@ -744,9 +780,10 @@ class Recorder:
                     step["_target"] = box
             else:
                 el = element_at(snap, *g.at)
-                if el is not None and self._redact_pin(snap, el):
+                if self._redact_pin(snap, el, frame.tree):
+                    self._secret_until = touch.end + SECRET_GRACE_S
                     step = {"action": g.kind, "redacted": True, "sure": sure,
-                            "note": "a password field had focus and this looked like a PIN-pad key: not recorded"}
+                            "note": "this looked like a PIN-pad key: not recorded"}
                     return step
                 if el is not None:
                     step["target"] = describe(el, frame.tree, self.platform, snap)
@@ -775,10 +812,22 @@ class Recorder:
             step["note"] = "; ".join(notes)
         return step
 
-    def _redact_pin(self, snap: Snapshot, el: Element) -> bool:
-        secure_focus = any(e.secure and e.focused for e in snap.all_elements)
-        label = (el.name or "").strip()
-        return secure_focus and not _is_field(el) and (len(label) <= 2 or label.isdigit())
+    def _redact_pin(self, snap: Snapshot, el: Element | None, tree: RawTree | None = None) -> bool:
+        """A key on a PIN pad: a password field has focus, or the screen is one (a 0-9 grid with no
+        calculator keys, or it asks for a PIN). A tap on nothing there may be a key drawn on a canvas."""
+        if el is not None and (_is_field(el) or not (len((el.name or "").strip()) <= 2
+                                                    or (el.name or "").strip().isdigit())):
+            return False
+        if any(e.secure and e.focused for e in snap.all_elements):
+            return True
+        names = {(e.name or "").strip() for e in snap.all_elements}
+        if tree is not None:
+            names |= {_clean_text(t) for n in tree.root.walk() if n.visible
+                      for t in (n.title, n.label, n.value if isinstance(n.value, str) else None) if t}
+        digits = {n for n in names if len(n) == 1 and n.isdigit()}
+        if len(digits) >= 9 and not {n.lower() for n in names} & _CALC_KEYS:
+            return True
+        return any(_PIN_WORDS.search(n) for n in names if n)
 
     def _merge_double(self, g: Gesture, touch: Touch) -> bool:
         if not self.pending:
@@ -905,13 +954,25 @@ class Recorder:
             k = base + (counts.get(base, 0),)
             counts[base] = counts.get(base, 0) + 1
             seen.add(k)
-            value = None if el.secure else (el.value or "")
+            secret = self._is_secret(el)
+            value = None if secret else (el.value or "")
             if el.focused:
                 focus = k
             fld = self._fields.get(k)
             if fld is None:
-                self._fields[k] = _Field(el, f.tree, value, value, f.end)
+                self._fields[k] = _Field(el, f.tree, value, value, f.end, secret=secret,
+                                         seen=hash(el.value) if secret and el.value else None)
                 continue
+            if secret and not fld.secret:  # a field turned out to be a password: forget what it showed before
+                fld.secret, fld.first, fld.last = True, None, None
+                fld.keys = max(fld.keys, 1)
+            if fld.secret:
+                value = None
+                plain = hash(el.value) if el.value else None
+                if plain is not None and plain != fld.seen:  # new text, kept only as a hash
+                    fld.keys += 1
+                    fld.changed_at = f.end
+                fld.seen = plain
             if value != fld.last:
                 fld.last = value
                 fld.changed_at = f.end
@@ -927,12 +988,24 @@ class Recorder:
             self._flush_field(k, f, submitted=prev is not None and prev.keyboard is not None and f.keyboard is None)
             del self._fields[k]
 
+    def _is_secret(self, el: Element) -> bool:
+        ident = el.extra.get("identifier") or ""
+        if el.secure:
+            if ident:
+                self._secret_ids.add(ident)
+            return True
+        if ident and ident in self._secret_ids:
+            return True
+        words = [ident.rpartition("/")[2], el.name or "", el.extra.get("description") or "",
+                 el.extra.get("placeholder") or ""]
+        return any(_SECRET_WORDS.search(w.replace("_", " ")) for w in words if w)
+
     def _changed(self, fld: _Field) -> bool:
-        return fld.last != fld.first or (fld.el.secure and fld.keys > 0)
+        return fld.last != fld.first or (fld.secret and fld.keys > 0)
 
     def _typing_shot(self, fld: _Field) -> None:
         """A field that has stopped changing gets its picture now, before the next touch moves on."""
-        if (self.shoot is None or not self._changed(fld) or fld.el.secure or fld.shot_value == fld.last
+        if (self.shoot is None or not self._changed(fld) or fld.secret or fld.shot_value == fld.last
                 or self.clock() - fld.changed_at < TYPING_SHOT_IDLE_S):
             return
         name = f"typing-{len(self.steps) + 1:02d}.png"
@@ -952,7 +1025,7 @@ class Recorder:
             return
         el = fld.el
         step: dict[str, Any] = {"action": "type", "target": describe(el, fld.tree, self.platform, self._snap(f))}
-        if el.secure:
+        if fld.secret:
             step["data"], step["secret"] = SECRET, True
         else:
             step["data"] = fld.last or ""
@@ -965,14 +1038,14 @@ class Recorder:
         if submitted:
             step["submitted"] = True
             step["submit_note"] = "the keyboard closed with no other touch: Enter / Done was pressed"
-        elif fld.idle_keys and not el.secure:
+        elif fld.idle_keys and not fld.secret:
             step["maybe_submitted"] = True
             step["submit_note"] = (f"{fld.idle_keys} keyboard touch{'es' if fld.idle_keys > 1 else ''} after the last "
                                    "change did not change the text: Enter / search, Shift, or a missed key")
         step["sure"] = True
         step["app"] = f.tree.app.name
         step = {"n": len(self.steps) + 1, "t": self._t(fld.changed_at or f.end), **step}
-        if el.secure:
+        if fld.secret:
             step["screenshot"] = None
             step["screenshot_note"] = "not taken for a password field"
         elif fld.shot is not None and fld.shot_value == fld.last:
