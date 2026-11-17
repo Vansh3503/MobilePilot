@@ -215,6 +215,13 @@ class IosSimulatorEngine(Engine):
                                    hint="Uninstall and reinstall the app (mobile_app install) for a clean state.")
         raise MobilePilotError(ErrorCode.INVALID_ARGUMENT, f"Unknown app action {action!r}.")
 
+    def touch_stream(self):
+        raise MobilePilotError(
+            ErrorCode.NOT_SUPPORTED,
+            "Recording what a person does by hand is not available on iOS yet: Apple gives no way to see touches "
+            "from outside a simulator or iPhone, so steps cannot be written down as they happen.",
+            hint="Record on an Android phone or emulator, or drive the app with the mobile_* tools instead.")
+
     def screenshot(self, path: str, *, max_side: int = 1280) -> tuple[int, int]:
         from PIL import Image
 

@@ -5,6 +5,36 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Found replaying a recorded Amazon flow on a Pixel 7a (2026-11-17):
+  - A launcher tap's locator is now the package it opened (strategy `app`: start it with `activate_app`). The icon was on another launcher page, so the replay could not find it.
+  - A tappable tile whose own resource-id every sibling shares now borrows the label inside it (`resourceId(...tiles_nav_item_text).text("Now")`). Before, it had no locator at all.
+  - A web link whose content-desc is a URL with a per-visit value (`pf_rd_r=…` changed between visits) is graded fragile, and `descriptionContains("nodeId=…")` on the part that stays is offered.
+  - A WebView card whose text repeats its name ("X X Add") is found by `textStartsWith(X)`, which survives "Add" becoming a quantity.
+- Found recording Amazon by hand on a Pixel 7a:
+  - A recorded step is sure when the element under the finger did not change between the two readings before the touch. The whole screen no longer has to hold still; carousels had made 19 of 25 steps unsure.
+  - A tap inside an empty WebView is reported as web content at a position.
+  - A launcher tap records the package it launched.
+- Locators (`mobile_locate` and recordings):
+  - An accessibility id holding a count, price or percentage is graded acceptable, with a `descriptionStartsWith` alternative.
+  - A tappable container with nothing of its own borrows a description or label from inside it.
+  - Text padded with invisible spaces is matched with `textContains`.
+
+### Added
+
+- `mobile_record` (start, status, stop): a person uses an Android phone or emulator by hand and
+  every step is written down with its graded locators, a screenshot and what it changed. It reads
+  the kernel's touch events (`adb shell getevent -lt`) and the screen tree in a loop, and matches
+  each gesture to the screen as it was just before the finger went down. Taps, double taps, long
+  presses, swipes (with the list they scrolled), drags, pinches, back/home/recents gestures,
+  three-button navigation bars, rotation, hardware keys and typed text are recognised. A gesture
+  made while the screen was still changing is marked unsure, never presented as fact; an edge
+  swipe the phone did not take as back says so. Keyboard and lock-screen touches are never
+  stored, passwords are written as `••••` and never photographed. Steps are appended to
+  `steps.jsonl` as they happen; `workflow.json` holds every detail. Folder: `MOBILEPILOT_RECORD_DIR`.
+  While recording, every other tool answers `RECORDING`. iOS answers `NOT_SUPPORTED` with why.
+
 Found by driving Calculator, Clock, Chrome, YouTube, Maps, Gmail, Messages, Contacts, Photos,
 Play Store, Amazon and a game on a Pixel 7a (Android 17):
 

@@ -1,0 +1,14 @@
+[   10445.054306] /dev/input/event1: EV_ABS       ABS_MT_TRACKING_ID   00000000            
+[   10445.054306] /dev/input/event1: EV_ABS       ABS_MT_PRESSURE      00000400            
+[   10445.054306] /dev/input/event1: EV_SYN       SYN_REPORT           00000000            
+[   10445.129159] /dev/input/event1: EV_ABS       ABS_MT_PRESSURE      00000000            
+[   10445.129159] /dev/input/event1: EV_ABS       ABS_MT_TRACKING_ID   ffffffff            
+[   10445.129159] /dev/input/event1: EV_SYN       SYN_REPORT           00000000            
+[   10445.279701] /dev/input/event1: EV_ABS       ABS_MT_TRACKING_ID   00000000            
+[   10445.279701] /dev/input/event1: EV_ABS       ABS_MT_POSITION_X    00004065            
+[   10445.279701] /dev/input/event1: EV_ABS       ABS_MT_POSITION_Y    00003c32            
+[   10445.279701] /dev/input/event1: EV_ABS       ABS_MT_PRESSURE      00000400            
+[   10445.279701] /dev/input/event1: EV_SYN       SYN_REPORT           00000000            
+[   10445.352902] /dev/input/event1: EV_ABS       ABS_MT_PRESSURE      00000000            
+[   10445.352902] /dev/input/event1: EV_ABS       ABS_MT_TRACKING_ID   ffffffff            
+[   10445.352902] /dev/input/event1: EV_SYN       SYN_REPORT           00000000            

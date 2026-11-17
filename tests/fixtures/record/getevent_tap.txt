@@ -1,0 +1,10 @@
+[   10438.658639] /dev/input/event1: EV_ABS       ABS_MT_TRACKING_ID   00000000            
+[   10438.658639] /dev/input/event1: EV_ABS       ABS_MT_POSITION_X    00003fff            
+[   10438.658639] /dev/input/event1: EV_ABS       ABS_MT_POSITION_Y    00003bff            
+[   10438.658639] /dev/input/event1: EV_ABS       ABS_MT_PRESSURE      00000400            
+[   10438.658639] /dev/input/event1: EV_ABS       ABS_MT_TOUCH_MAJOR   00000500            
+[   10438.658639] /dev/input/event1: EV_ABS       ABS_MT_TOUCH_MINOR   00000500            
+[   10438.658639] /dev/input/event1: EV_SYN       SYN_REPORT           00000000            
+[   10438.766507] /dev/input/event1: EV_ABS       ABS_MT_PRESSURE      00000000            
+[   10438.766507] /dev/input/event1: EV_ABS       ABS_MT_TRACKING_ID   ffffffff            
+[   10438.766507] /dev/input/event1: EV_SYN       SYN_REPORT           00000000            

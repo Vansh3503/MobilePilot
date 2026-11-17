@@ -1,4 +1,4 @@
-"""The MCP server: fourteen ``mobile_*`` tools over one persistent device connection.
+"""The MCP server: fifteen ``mobile_*`` tools over one persistent device connection.
 
 Built for few model round trips per screen (``mobile_snapshot`` → act and read the diff →
 optional evidence): every action waits until the screen settles and returns what changed, rows
@@ -80,6 +80,8 @@ Per screen: mobile_snapshot once, then act (mobile_tap / mobile_type / mobile_sw
 Each row shows its locators inline: aid = accessibility id (strongest), id= = Android resource-id. Call mobile_locate once at the end with the refs you used, for graded locators to put in a script. Long lists: mobile_find(text, scroll=true) scrolls on the server. Slow screens, spinners, toasts: mobile_wait_for. No device: every tool says NO_DEVICE; ask the developer to start one.
 
 When a tap opens a menu, drop-down, dialog or sheet, the result says "opened: <kind>" and lists every option with its ref: pick one directly. A "permission dialog" or "system dialog" is the person's decision: never answer it yourself; say what it asks and wait. NEEDS_USER (a locked phone) also needs the person.
+
+To write down what the PERSON does by hand (they use the phone, you do not), mobile_record(action="start"), wait for them, then mobile_record(action="stop") returns the steps.
 
 Unlabeled icons show as "button unlabeled, top-left  id=…". If you cannot tell which ref you need, or the screen has no tree (games, Flutter, canvas, thin web views), mobile_screenshot(annotate=true, show=true) draws the refs on the image; with no ref at all, tap the image's pixels with coordinate_space="screenshot" and its screenshot_id."""
 
@@ -201,11 +203,17 @@ class Session:
         """Screenshot id → (image pixels per device pixel, snapshot it was annotated from)."""
         self._lock = anyio.Lock()
         self._last_action = float("-inf")
+        self.recording: Any = None
+        """A :class:`mobilepilot.record.Session` while a person is using the phone (mobile_record)."""
+        self.record_dir = Path(os.environ.get("MOBILEPILOT_RECORD_DIR") or Path.cwd() / "mobilepilot-recordings")
 
     # ------------------------------------------------------------------ plumbing
     async def run(self, fn: Callable[..., T], *args: Any, timeout_s: float = ENGINE_TIMEOUT_S, **kwargs: Any) -> T:
         """Run blocking device work in a worker thread, one call at a time, with a deadline."""
         call = functools.partial(fn, *args, **kwargs)
+        if self.recording is not None and self.recording.running:
+            raise MobilePilotError(ErrorCode.RECORDING, "A recording is running: the person is using the phone, so "
+                                   "nothing else may drive it now.")
         if self.engine is None:  # the first call connects, which installs uiautomator2's server
             timeout_s = CALL_CEILING_S
         timeout_s = min(timeout_s, CALL_CEILING_S)
@@ -846,6 +854,52 @@ class Session:
         text = await self.run(work)
         return [text, Image(path=target)] if show else text
 
+    async def record(self, action: Literal["start", "status", "stop"], app: str | None = None) -> str:
+        from mobilepilot import record
+
+        rec = self.recording
+        if action == "start":
+            if rec is not None and rec.running:
+                return (f"A recording is already running ({len(rec.recorder.steps)} steps so far). "
+                        "Call mobile_record(action=\"stop\") when the person is done.")
+
+            def begin() -> Any:
+                engine = self._engine()
+                if app:
+                    engine.app("launch", app=app)
+                    self._settle(engine, SETTLE_S["launch"])
+                folder = self.record_dir / time.strftime("%Y%m%d-%H%M%S")
+                n = 1
+                while folder.exists():
+                    n += 1
+                    folder = self.record_dir / (time.strftime("%Y%m%d-%H%M%S") + f"-{n}")
+                name = (self.device.name if self.device and self.device.name else None) or (
+                    self.device.serial if self.device else "the device")
+                session = record.Session(engine, folder, device=name)
+                session.start()
+                return session
+
+            self.recording = await self.run(begin, timeout_s=CALL_CEILING_S)
+            self.store.clear()
+            self.trees.clear()  # the person will move the screen: old refs mean nothing after this
+            name = self.recording.recorder.device
+            return (f"Recording on {name}. The person uses the phone as normal; every tap, swipe, typed text and key "
+                    f"is written down with its locators (no model calls while recording). Say when they are done, then "
+                    f"call mobile_record(action=\"stop\").\nFolder: {self.recording.folder}")
+        if rec is None:
+            return "No recording is running. Start one with mobile_record(action=\"start\")."
+        if action == "status":
+            steps = rec.recorder.steps
+            lines = [f"Recording {'running' if rec.running else 'ended'}: {len(steps)} step{'s' if len(steps) != 1 else ''} so far."]
+            lines += [f"  {s['n']}. {record.step_action(s)} {record.step_target(s)}".rstrip() for s in steps[-3:]]
+            if rec.error:
+                lines.append(f"note: {rec.error}")
+            return "\n".join(lines)
+        workflow = await anyio.to_thread.run_sync(rec.stop)
+        self.recording = None
+        self._last_action = float("-inf")  # the phone may have locked meanwhile: check before the next action
+        return record.format_table(workflow, rec.folder)
+
     async def locate(self, refs: list[str]) -> str:
         if not refs:
             raise MobilePilotError(ErrorCode.INVALID_ARGUMENT, "Pass the refs you want locators for.")
@@ -1002,6 +1056,16 @@ def build_server(session: Session | None = None) -> _Server:
         in the evidence folder. show=true also returns the image. annotate=true draws every ref on
         its element: use it to match an unlabeled icon to its ref. Secure screens come out black."""
         return await session.screenshot(path, show, annotate)
+
+    @tool
+    async def mobile_record(action: Literal["start", "status", "stop"], app: str | None = None) -> str:
+        """Write down what a PERSON does on the phone by hand (Android): start, let them use the
+        phone, then stop. Each tap, long-press, swipe, pinch, typed text, back/home gesture and
+        hardware key becomes a step with graded locators and a screenshot. start returns at once
+        (app: launch it first); while recording every other mobile_* tool refuses. status: steps
+        so far. stop: the step table and the folder (workflow.json has every detail). Passwords
+        are written as ••••, keyboard and lock-screen touches are never stored."""
+        return await session.record(action, app)
 
     @tool
     async def mobile_locate(refs: list[str]) -> str:

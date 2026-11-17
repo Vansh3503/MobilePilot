@@ -1,0 +1,6 @@
+[   10441.452488] /dev/input/event1: EV_ABS       ABS_MT_TRACKING_ID   00000000            
+[   10441.452488] /dev/input/event1: EV_ABS       ABS_MT_PRESSURE      00000400            
+[   10441.452488] /dev/input/event1: EV_SYN       SYN_REPORT           00000000            
+[   10442.378777] /dev/input/event1: EV_ABS       ABS_MT_PRESSURE      00000000            
+[   10442.378777] /dev/input/event1: EV_ABS       ABS_MT_TRACKING_ID   ffffffff            
+[   10442.378777] /dev/input/event1: EV_SYN       SYN_REPORT           00000000            

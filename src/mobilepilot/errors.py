@@ -24,6 +24,7 @@ class ErrorCode(StrEnum):
     NEEDS_USER = "NEEDS_USER"
     COMMAND_FAILED = "COMMAND_FAILED"
     INTERNAL = "INTERNAL"
+    RECORDING = "RECORDING"
 
 
 _DEFAULT_HINTS: dict[ErrorCode, str] = {
@@ -33,6 +34,7 @@ _DEFAULT_HINTS: dict[ErrorCode, str] = {
     ),
     ErrorCode.STALE_REF: "The screen changed since that snapshot. Call mobile_snapshot again and use the new refs.",
     ErrorCode.SNAPSHOT_NOT_FOUND: "Snapshots expire. Call mobile_snapshot again.",
+    ErrorCode.RECORDING: "A person is using the phone for a recording: call mobile_record(action=\"stop\") first.",
     ErrorCode.ELEMENT_NOT_FOUND: "Nothing on screen matches. Scroll (mobile_find scroll=true) or check the screen.",
 }
 

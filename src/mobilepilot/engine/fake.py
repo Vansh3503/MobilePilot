@@ -34,6 +34,14 @@ class FakeEngine(Engine):
         """Screen size ``capture_tree`` reports; ``rotate`` swaps it."""
         """Size of the PNG ``screenshot`` writes (smaller than the screen to test scaling)."""
         self.typed: list[str] = []
+        self.stream = None
+        """A :class:`mobilepilot.record.ScriptedStream` for ``touch_stream`` (None: not supported)."""
+        self.timeline: list[tuple[float, str]] = []
+        """(seconds after ``touch_stream`` was opened, screen): the person moving through the app."""
+        self.keyboards: dict[str, object] = {}
+        """Screen → keyboard Rect while that screen shows."""
+        self.locked: set[str] = set()
+        self._opened_at: float | None = None
 
     def capture_tree(self) -> RawTree:
         self.last_fingerprint = self.signature()
@@ -101,6 +109,28 @@ class FakeEngine(Engine):
         if action == "clear" and not app:
             raise MobilePilotError(ErrorCode.INVALID_ARGUMENT, "clear needs app.")
         return f"{action} {app or path or ''}".strip()
+
+    def touch_stream(self):
+        if self.stream is None:
+            return super().touch_stream()
+        import time
+
+        self._opened_at = time.monotonic()
+        return self.stream
+
+    def record_state(self):
+        import time
+
+        from mobilepilot.record import Frame
+
+        if self._opened_at is not None:
+            elapsed = time.monotonic() - self._opened_at
+            for at, screen in self.timeline:
+                if elapsed >= at:
+                    self.current = screen
+        tree = self.capture_tree()
+        return Frame(0.0, 0.0, tree, self.signature(), keyboard=self.keyboards.get(self.current),
+                     locked=self.current in self.locked)
 
     def screenshot(self, path: str, *, max_side: int = 1280) -> tuple[int, int]:
         from PIL import Image

@@ -131,7 +131,7 @@ def test_handshake_and_tools_work_with_no_device(tmp_path):
 
     tools, snap, listing = anyio.run(go)
     assert tools == ["mobile_app", "mobile_devices", "mobile_drag", "mobile_find", "mobile_key", "mobile_locate",
-                     "mobile_pinch", "mobile_rotate", "mobile_screenshot", "mobile_snapshot", "mobile_swipe",
+                     "mobile_pinch", "mobile_record", "mobile_rotate", "mobile_screenshot", "mobile_snapshot", "mobile_swipe",
                      "mobile_tap", "mobile_type", "mobile_wait_for"]
     assert snap.is_error and "NO_DEVICE" in _text(snap)
     assert not listing.is_error and "No devices" in _text(listing)
@@ -301,7 +301,7 @@ def test_stdio_server_answers_the_handshake_without_touching_a_device():
             async with Client(params) as client:
                 return [t.name for t in (await client.list_tools()).tools]
 
-    assert len(anyio.run(go)) == 14
+    assert len(anyio.run(go)) == 15
 
 
 def test_screenshot_paths_stay_in_the_evidence_folder(tmp_path):

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from mobilepilot.errors import ErrorCode, MobilePilotError
 from mobilepilot.models import RawTree
@@ -102,6 +102,27 @@ class Engine(ABC):
     @abstractmethod
     def screenshot(self, path: str, *, max_side: int = 1280) -> tuple[int, int]:
         """Write a PNG to ``path`` (longest side at most ``max_side``); returns its size."""
+
+    # ------------------------------------------------------------ recording a person (mobile_record)
+    def touch_stream(self) -> Any:
+        """The device's raw touch events (a :class:`mobilepilot.record.ProcessStream` or similar)."""
+        raise MobilePilotError(ErrorCode.NOT_SUPPORTED,
+                               "Recording what a person does by hand needs the device's touch events, which this device "
+                               "does not give.", hint="Use an Android phone or emulator.")
+
+    def input_config(self) -> Any:
+        """Touch timings and navigation mode (a :class:`mobilepilot.record.InputConfig`)."""
+        from mobilepilot.record import InputConfig
+
+        return InputConfig()
+
+    def record_state(self) -> Any:
+        """One reading of the screen for the recorder (a :class:`mobilepilot.record.Frame`)."""
+        from mobilepilot.record import Frame
+
+        tree = self.capture_tree()
+        fp = self.last_fingerprint if self.last_fingerprint is not None else self.signature()
+        return Frame(0.0, 0.0, tree, fp, keyboard=tree.keyboard_frame if tree.keyboard else None)
 
     def close(self) -> None:  # noqa: B027 - optional hook
         """Release the device connection."""

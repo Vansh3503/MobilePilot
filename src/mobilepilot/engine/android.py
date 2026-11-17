@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 import shutil
 import time
 import xml.etree.ElementTree as ET
@@ -262,6 +263,20 @@ def _overlays(windows: list[ET.Element], nodes: list[RawNode], package: str, scr
 _TICKING = re.compile(r'(?:text|content-desc)="[^"]*\d[^"]*"')
 
 
+def ime_frame(out: str) -> Rect | None:
+    """The keyboard's area from ``dumpsys window InputMethod``: the IME window's frame minus its
+    content inset (the window spans the screen; only the part below the inset is keys)."""
+    if "isVisible=true" not in out:
+        return None
+    frame = re.search(r" frame=\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]", out)
+    inset = re.search(r"mGivenContentInsets=\[\d+,(\d+)\]", out)
+    if not frame or not inset or int(inset.group(1)) <= 0:
+        return None
+    x1, y1, x2, y2 = map(int, frame.groups())
+    top = y1 + int(inset.group(1))
+    return Rect(x1, top, x2 - x1, y2 - top) if y2 > top else None
+
+
 def fingerprint(xml: str) -> int:
     """CRC of a dump with the digits inside text left out: a clock, a video position or a
     download percentage changes every frame and would keep a screen "unsettled" for the whole
@@ -378,14 +393,78 @@ class AndroidEngine(Engine):
     def capture_tree(self) -> RawTree:
         xml = self._call(self._d.dump_hierarchy)
         self.last_fingerprint = fingerprint(xml)
-        current = self._foreground()
+        return self._tree(xml, self._foreground())
+
+    def _rotation(self, xml: str) -> int:
         rotation = re.search(r'<hierarchy rotation="(\d)"', xml)
         if rotation and rotation.group(1) in "13" and self._size[0] < self._size[1]:
             self._size = (self._size[1], self._size[0])
         elif rotation and rotation.group(1) in "02" and self._size[0] > self._size[1]:
             self._size = (self._size[1], self._size[0])
+        return int(rotation.group(1)) if rotation else 0
+
+    def _tree(self, xml: str, current: dict) -> RawTree:
+        self._rotation(xml)
         return parse_hierarchy(xml, package=current.get("package"), activity=current.get("activity"),
                                pid=current.get("pid") or 0, size=self._size)
+
+    # ------------------------------------------------------------------ recording (mobile_record)
+    def touch_stream(self):
+        from mobilepilot.record import ProcessStream, parse_panels
+
+        adb = find_adb()
+        info = subprocess.run([adb, "-s", self.serial, "shell", "getevent", "-pl"], capture_output=True, text=True,
+                              timeout=15).stdout
+        panels = parse_panels(info)
+        if not panels:
+            raise MobilePilotError(ErrorCode.NOT_SUPPORTED, "No touchscreen found in the phone's input devices.",
+                                   hint="`adb shell getevent -pl` lists them; a phone without one cannot be recorded.")
+        return ProcessStream([adb, "-s", self.serial, "shell", "getevent", "-lt"], panels, self._natural())
+
+    def _natural(self) -> tuple[int, int]:
+        """The display's size in its natural orientation (what the touch panel maps onto)."""
+        out = self._call(self._d.shell, ["wm", "size"]).output
+        sizes = re.findall(r"(Physical|Override) size: (\d+)x(\d+)", out)
+        if not sizes:
+            return tuple(sorted(self._size)) if self._size[0] > self._size[1] else self._size  # type: ignore[return-value]
+        kind, w, h = sizes[-1]  # an override (wm size 1080x1920) is what the display uses
+        return int(w), int(h)
+
+    def input_config(self):
+        from mobilepilot.record import InputConfig
+
+        out = self._call(self._d.shell, "settings get secure long_press_timeout; settings get secure navigation_mode; "
+                         "wm density").output.split()
+        cfg = InputConfig()
+        nums = [w for w in out if w.isdigit()]
+        if len(nums) >= 3:
+            cfg.long_press_s = int(nums[0]) / 1000 if 100 <= int(nums[0]) <= 3000 else cfg.long_press_s
+            cfg.nav_mode = int(nums[1]) if nums[1] in "012" else cfg.nav_mode
+            cfg.density = float(nums[-1])  # the override density when one is set comes last
+        return cfg
+
+    _STATE = ("dumpsys activity activities | grep -m1 topResumedActivity; "
+              "dumpsys window InputMethod | grep -oE 'isVisible=[a-z]+|mGivenContentInsets=\\[[0-9,]+\\]\\[[0-9,]+\\]|"
+              " frame=\\[[0-9,-]+\\]\\[[0-9,-]+\\]' | head -4; "
+              "dumpsys window | grep -m1 -oE 'isKeyguardShowing=[a-z]+'; "
+              "dumpsys power | grep -m1 -oE 'mWakefulness=[A-Za-z]+'")
+    """One shell round trip: the foreground activity, where the keyboard is, and whether the lock
+    screen is up. Android 17 dumps only the focused window, so the keyboard is not in the tree."""
+
+    def record_state(self):
+        from mobilepilot.record import Frame
+
+        xml = self._call(self._d.dump_hierarchy)
+        out = self._call(self._d.shell, self._STATE).output
+        fp = fingerprint(xml)
+        self.last_fingerprint = fp
+        m = re.search(r"u\d+ ([\w.]+)/([\w.$]+)", out)
+        current = {"package": m.group(1), "activity": m.group(2), "pid": 0} if m else {}
+        rotation = self._rotation(xml)
+        tree = self._tree(xml, current)
+        keyboard = tree.keyboard_frame if tree.keyboard else ime_frame(out)
+        locked = "isKeyguardShowing=true" in out or ("mWakefulness=" in out and "mWakefulness=Awake" not in out)
+        return Frame(0.0, 0.0, tree, fp, keyboard=keyboard, locked=locked, rotation=rotation)
 
     def signature(self) -> int:
         """A cheap fingerprint of the screen (no app lookup), for waiting until it settles."""

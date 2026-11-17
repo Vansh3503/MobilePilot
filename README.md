@@ -38,7 +38,8 @@ every result under 1,000 characters. Tree dumps go through uiautomator2 (51 ms) 
 link), `mobile_snapshot`, `mobile_tap` (long press, double tap), `mobile_type`, `mobile_swipe`,
 `mobile_drag`, `mobile_pinch`, `mobile_rotate`, `mobile_key` (including the notification shade),
 `mobile_find` (scrolls on the server), `mobile_wait_for`, `mobile_screenshot` (annotated with refs
-on request), `mobile_locate` (graded Appium locators for the refs you used).
+on request), `mobile_locate` (graded Appium locators for the refs you used), `mobile_record`
+(write down what a person does on an Android phone by hand: start, use the phone, stop).
 
 A tap that opens a menu, drop-down, dialog or sheet says so and lists every option with its ref:
 
@@ -55,6 +56,22 @@ Permission and system dialogs are reported, never answered. Unlabeled icons show
 image, and taps and drags accept that image's pixels (`coordinate_space="screenshot"`) when no ref
 exists. A phone that locked itself is woken; a PIN is left to the person (`NEEDS_USER`). If the person
 uses the phone between calls, the next action works from the screen as it really is.
+
+`mobile_record` turns a person's hands into steps without a model:
+
+```
+Recorded 6 steps on emulator qa-test in 26.3 s.
+#   action          target                    locator (best)                                  data
+1   tap             row "Network & internet"  fragile: -android uiautomator new UiSelector()…
+      → new screen: Network & internet
+3   tap             switch in "Wi-Fi"         acceptable: id android:id/switch_widget
+      → "Wi-Fi" switch: on → off
+5   tap             button "Navigate up"      strong: accessibility id Navigate up
+8   type            field "Search settings"   acceptable: id com.google.android…            display
+```
+
+Touches are read with `adb shell getevent` (no root). Taps injected with `adb shell input` or
+uiautomator never reach that stream; test with a hand, or the emulator console's `event send`.
 
 ## Run
 
