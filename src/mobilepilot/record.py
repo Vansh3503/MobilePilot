@@ -549,6 +549,10 @@ class _Field:
     """Once a password field, always: a reading without the flag (a show-password toggle) is not typed data."""
     seen: int | None = None
     """A hash of a secret field's plain text, when a reading shows it: change is noticed, the text is not kept."""
+    key_times: list[float] = field(default_factory=list)
+    """When each key went down (times only, never where): keys after the last reading may not be in the text."""
+    seen_start: float = 0.0
+    """When the last reading that showed this field began."""
 
 
 class Recorder:
@@ -584,6 +588,9 @@ class Recorder:
         self._pinned: tuple[float, Frame | None, bool] | None = None
         self._pinned_sure = False
         self._seq = 0
+        self._reading: Frame | None = None
+        self._orphan_keys: list[float] = []
+        """Keys pressed before any reading showed which field they went to."""
         self._jsonl = self.folder / "steps.jsonl"
         self._jsonl.write_text("")
 
@@ -633,10 +640,54 @@ class Recorder:
         return round(max(t - self.started, 0.0), 2)
 
     # ---------------------------------------------------------------- inputs
-    def frame(self, f: Frame) -> None:
-        prev = self.frames[-1] if self.frames else None
+    def reading(self, f: Frame) -> None:
+        """A reading has finished but the touches made while it ran are still being handed over."""
         self._seq += 1
         f.seq = self._seq
+        self._reading = f
+
+    def _screen_at(self, t: float) -> Frame | None:
+        """The reading a touch at ``t`` landed on. Normally the last one finished before it; but when
+        that one began before the previous gesture ended (the next screen was still loading) and the
+        reading running at ``t`` began after it, the running one shows the screen the finger hit.
+        Pixel 7a 2026-11-17: "Open" on YouTube's page was recorded as "157 MB" of the results before it."""
+        frame = self._frame_before(t)
+        up = self._reading
+        if (up is not None and not up.locked and self._last_touch_end <= up.start <= t
+                and (frame is None or frame.start < self._last_touch_end)):
+            return up
+        return frame
+
+    def _on_keys(self, frame: Frame | None, t: float, x: float, y: float) -> bool:
+        """A touch is a key if the reading before it, OR the one running when it happened, shows a
+        keyboard there. Keys come faster than a reading (0.26 s apart against 0.4 s, Pixel 7a
+        2026-11-17): judged only by the reading before, the first keys after a keyboard opens were
+        written as taps with their positions. Fails closed: a tap that opened the keyboard under
+        itself is lost, which is better than keeping where keys were pressed."""
+        if frame is not None and _inside(keys_area(frame, self.natural), x, y):
+            return True
+        up = self._reading
+        return up is not None and up.start <= t and not up.locked and _inside(keys_area(up, self.natural), x, y)
+
+    def _key_pressed(self, at: float, end: float) -> None:
+        self.keyboard_touches += 1
+        if self._focus is not None and self._focus in self._fields:
+            fld = self._fields[self._focus]
+            fld.keys += 1
+            fld.idle_keys += 1
+            fld.key_times.append(at)
+            fld.changed_at = end
+            if fld.secret:
+                self._secret_until = end + SECRET_GRACE_S
+        else:
+            self._orphan_keys.append(at)
+
+    def frame(self, f: Frame) -> None:
+        self._reading = None
+        prev = self.frames[-1] if self.frames else None
+        if not f.seq:   # reading() numbered it already
+            self._seq += 1
+            f.seq = self._seq
         self.frames.append(f)
         if prev is not None and prev.rotation % 2 != f.rotation % 2 and not f.locked:
             self._flush_typing(f, submitted=False)
@@ -653,14 +704,14 @@ class Recorder:
         touch changes it) and close any typing. A key on the keyboard or the lock screen changes
         nothing here. A tap that may become a double tap waits."""
         self._down = t
-        frame = self._frame_before(t)
+        frame = self._screen_at(t)
         if frame is None or frame.locked:
             self._pinned = (t, frame, False)
             return
         dx, dy = to_display(x, y, frame.rotation, self.natural)
         # pinned now: by the time the finger lifts (a long drag) this reading may have left the buffer
         self._pinned = (t, frame, x >= 0 and self._sure(frame, dx, dy))
-        if _inside(keys_area(frame, self.natural), dx, dy):
+        if self._on_keys(frame, t, dx, dy):
             return
         self._flush_typing(frame, submitted=False)
         for p in list(self.pending):
@@ -673,7 +724,7 @@ class Recorder:
         if pinned is not None and abs(pinned[0] - touch.start) < 0.5:
             frame, self._pinned_sure = pinned[1], pinned[2]
         else:
-            frame = self._frame_before(touch.start)
+            frame = self._screen_at(touch.start)
             self._pinned_sure = None
         self._down = None
         rotation = frame.rotation if frame is not None else 0
@@ -684,16 +735,9 @@ class Recorder:
         if frame is not None and frame.locked:
             self._lock_touch(touch)
             return
-        if frame is not None and _inside(keys_area(frame, self.natural), x0, y0):
+        if frame is not None and self._on_keys(frame, touch.start, x0, y0):
             # never stored: where keys were pressed spells what was typed
-            self.keyboard_touches += 1
-            if self._focus is not None and self._focus in self._fields:
-                fld = self._fields[self._focus]
-                fld.keys += 1
-                fld.idle_keys += 1
-                fld.changed_at = touch.end
-                if fld.secret:
-                    self._secret_until = touch.end + SECRET_GRACE_S
+            self._key_pressed(touch.start, touch.end)
             return
         if frame is None:
             # nothing read yet: it may have been a key on a keyboard nobody has seen, so no position
@@ -960,9 +1004,17 @@ class Recorder:
                 focus = k
             fld = self._fields.get(k)
             if fld is None:
-                self._fields[k] = _Field(el, f.tree, value, value, f.end, secret=secret,
-                                         seen=hash(el.value) if secret and el.value else None)
+                fld = self._fields[k] = _Field(el, f.tree, value, value, f.end, secret=secret,
+                                               seen=hash(el.value) if secret and el.value else None, seen_start=f.start)
+                if el.focused and self._orphan_keys:
+                    # the keys went here before any reading showed the field: what it held before is unknown
+                    fld.first, fld.keys, fld.key_times = None, len(self._orphan_keys), self._orphan_keys
+                    fld.changed_at = f.end
+                    if secret:
+                        self._secret_until = max(self._secret_until, self._orphan_keys[-1] + SECRET_GRACE_S)
+                    self._orphan_keys = []
                 continue
+            fld.seen_start = f.start
             if secret and not fld.secret:  # a field turned out to be a password: forget what it showed before
                 fld.secret, fld.first, fld.last = True, None, None
                 fld.keys = max(fld.keys, 1)
@@ -984,6 +1036,7 @@ class Recorder:
         elif prev is not None and prev.keyboard is not None and f.keyboard is None and self._focus is not None:
             self._flush_field(self._focus, f, submitted=True)
         self._focus = focus
+        self._orphan_keys = []   # keys no reading could tie to a field stay counted, nothing more
         for k in [k for k in self._fields if k not in seen]:  # a field that left the screen
             self._flush_field(k, f, submitted=prev is not None and prev.keyboard is not None and f.keyboard is None)
             del self._fields[k]
@@ -1031,10 +1084,20 @@ class Recorder:
             step["data"] = fld.last or ""
             if fld.first and not (fld.last or "").startswith(fld.first):
                 step["cleared"] = True  # the field held text that was deleted first
+            notes = []
             if el.value_digest is not None:
-                step["note"] = "the value is longer than the screen tree shows: cut"
-            if not fld.last:
+                notes.append("the value is longer than the screen tree shows: cut")
+            if not fld.last and fld.first is None:
+                step["data"] = None
+                notes.append(f"{fld.keys} key presses, but no screen reading saw the text: fill it in from what was typed")
+            elif not fld.last:
                 step["cleared"], step["data"] = True, ""
+            late = sum(1 for t in fld.key_times if t > fld.seen_start) - (1 if submitted else 0)
+            if late > 0 and step["data"]:
+                notes.append(f"{late} key press{'es' if late > 1 else ''} came after the last reading of the field: "
+                             "the text may be incomplete; check it against the next screenshot")
+            if notes:
+                step["note"] = "; ".join(notes)
         if submitted:
             step["submitted"] = True
             step["submit_note"] = "the keyboard closed with no other touch: Enter / Done was pressed"
@@ -1062,6 +1125,7 @@ class Recorder:
         self.steps.append(step)
         self._write(step)
         fld.first, fld.keys, fld.idle_keys, fld.shot, fld.shot_value = fld.last, 0, 0, None, None
+        fld.key_times = []
 
     # ---------------------------------------------------------------- what an action did
     def effect(self, before: Snapshot, before_tree: RawTree | None, after: Snapshot, after_tree: RawTree,
@@ -1282,6 +1346,7 @@ class Session:
                     time.sleep(0.3)
                     continue
                 state.start, state.end = begin, time.monotonic()
+                self.recorder.reading(state)   # touches made while it ran are judged by it too
                 self._drain()
                 self.recorder.frame(state)
                 if self.reader_ended and self.events.empty():

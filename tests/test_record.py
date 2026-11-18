@@ -3,6 +3,7 @@ dumps through the real parser, the Recorder, and the tool through the real MCP s
 
 from __future__ import annotations
 
+import html
 import json
 import time
 from pathlib import Path
@@ -423,6 +424,7 @@ def test_typing_is_read_from_the_field_and_keyboard_touches_are_never_stored(tmp
     typed = wf["steps"][0]
     assert typed["data"] == "Office-5G" and typed["target"]["id"] == f"{PKG}:id/name"
     assert typed["screenshot"] == "step-01-type.png" and not typed.get("submitted")
+    assert "note" not in typed   # every key came before the reading that saw the text: nothing may be missing
     written = (r.rec.folder / "steps.jsonl").read_text() + (r.rec.folder / "workflow.json").read_text()
     for x, y in [(30, 450), (90, 520), (200, 600)]:
         assert f"[{x}, {y}]" not in written and f"[{x},{y}]" not in written
@@ -436,6 +438,78 @@ def test_text_that_arrives_with_no_keyboard_touch_is_still_recorded(tmp_path):
     r.settle(field_screen("hello"), 2.0)
     r.tap(160, 224, 4.0)
     assert [(s["action"], s.get("data")) for s in r.stop()["steps"]][0] == ("type", "hello")
+
+
+def test_keys_pressed_while_the_keyboard_is_first_being_read_are_never_taps(tmp_path):
+    """Pixel 7a, 2026-11-17: "y", "o" and Enter came 0.26 s apart and a reading takes 0.4 s. The
+    reading that first showed the keyboard was still running, so the keys were judged against the
+    one before it: written as taps with their positions (which spell what was typed), and the text
+    was lost because the field was first seen already holding it."""
+    vending = "com.android.vending"
+
+    def read(xml, start, end, keyboard=None):
+        t = parse_hierarchy(xml, package=vending, activity="Main", size=NATURAL)
+        return Frame(start, end, t, fingerprint(xml), keyboard=keyboard)
+
+    home = screen(node("android.view.View", "[10,40][310,100]", desc="Search Google Play", clickable=True, pkg=vending)
+                  + node("android.view.View", "[0,420][320,520]", desc="Instagram&#10;Meta&#10;", clickable=True,
+                         pkg=vending), pkg=vending)
+    box = screen(node("EditText", "[10,40][310,100]", text="y", clickable=True, focused=True, pkg=vending)
+                 + node("android.view.View", "[0,420][320,520]", desc="Search for 'amazon' ", clickable=True,
+                        pkg=vending), pkg=vending)
+    results = screen(node("android.view.View", "[0,120][320,230]", desc="YouTube&#10;Google LLC&#10;", clickable=True,
+                          pkg=vending), pkg=vending)
+    r = Rig(tmp_path)
+    r.settle(home, 1.0, pkg=vending)
+    r.tap(160, 70, 2.0)                                   # the search bar
+    r.rec.frame(read(home, 2.05, 2.5))                    # the keyboard is still opening
+    showing = read(box, 2.55, 3.2, keyboard=KEYBOARD)     # the reading that first sees it...
+    r.rec.reading(showing)
+    r.tap(150, 450, 2.8)                                  # ..."y" and "o" land while it runs
+    r.tap(280, 470, 3.05)
+    r.now = 3.2
+    r.rec.frame(showing)
+    r.tap(300, 600, 3.3)                                  # Enter
+    r.rec.frame(read(results, 3.35, 3.8))
+    r.settle(results, 4.0, pkg=vending)
+    wf = r.stop()
+    written = (r.rec.folder / "steps.jsonl").read_text() + (r.rec.folder / "workflow.json").read_text()
+    for x, y in [(150, 450), (280, 470), (300, 600)]:
+        assert f"[{x}, {y}]" not in written, written
+    assert [s["action"] for s in wf["steps"]] == ["tap", "type"], wf["steps"]
+    typed = wf["steps"][1]
+    assert typed["data"] == "y" and typed["submitted"] is True
+    assert "may be incomplete" in typed["note"], typed      # "o" came after that reading began
+    assert "3 keyboard touches were not stored" in " ".join(wf["notes"])
+
+
+def test_a_tap_on_a_screen_still_being_read_is_named_from_that_screen(tmp_path):
+    """Pixel 7a, 2026-11-17: "Open" on YouTube's page was recorded as "157 MB", the element at that
+    spot on the search results the page replaced. The only finished reading predated the previous
+    tap; the one running when the finger went down already showed the new page."""
+    vending = "com.android.vending"
+
+    def read(xml, start, end, pkg=vending):
+        return Frame(start, end, parse_hierarchy(xml, package=pkg, activity="Main", size=NATURAL), fingerprint(xml))
+
+    results = screen(node("android.view.View", "[0,120][320,230]", desc="YouTube&#10;Google LLC&#10;", clickable=True,
+                          pkg=vending)
+                     + node("android.view.View", "[200,240][300,300]", desc="157 MB", clickable=True, pkg=vending),
+                     pkg=vending)
+    page = screen(node("android.view.View", "[200,240][300,300]", desc="Open", clickable=True, pkg=vending), pkg=vending)
+    r = Rig(tmp_path)
+    r.settle(results, 4.0, pkg=vending)
+    r.tap(160, 170, 5.0)                       # the YouTube result
+    loading = read(page, 5.3, 5.9)             # its page: a reading that began after that tap
+    r.rec.reading(loading)
+    r.tap(250, 270, 5.6)                       # "Open", while that reading runs
+    r.now = 5.9
+    r.rec.frame(loading)
+    r.settle(screen(node("FrameLayout", "[0,0][320,640]", pkg="com.google.android.youtube"),
+                    pkg="com.google.android.youtube"), 6.5, pkg="com.google.android.youtube")
+    step = r.stop()["steps"][-1]
+    assert step["target"]["name"] == "Open", step
+    assert step["target"]["locator"]["value"] == "Open" and step["sure"] is False   # still checked by hand
 
 
 def test_a_password_is_never_written_and_never_photographed(tmp_path):
@@ -886,6 +960,137 @@ def test_a_web_card_whose_text_repeats_its_name_is_found_by_the_name():
                          children=card(0, "Bisleri Mineral Water Jar") + card(160, "Clear Premium Drinking Water"))))
     pick = best(candidates(_el_at(t, 50, 200), t, "android"))
     assert pick.value == 'new UiSelector().textStartsWith("Bisleri Mineral Water Jar")', pick
+
+
+# --------------------------------------------------------------------------- locators from a live Play Store session
+# Shapes from the Pixel 7a recording of 2026-11-17: a Compose tile is a clickable View whose only label
+# is a non-clickable View inside it, and its content-desc joins every line of the card with newlines.
+def _appium_arg(selector):
+    """What Appium's UiSelector parser hands to UiAutomator: the quotes stripped and only \\" unescaped
+    (appium-uiautomator2-server UiExpressionParser.coerceArgToType). \\n stays a backslash and an n."""
+    import re
+
+    inner = re.search(r'\("([\s\S]*)"\)$', selector).group(1)
+    return inner.replace('\\"', '"')
+
+
+def _store(*cards):
+    def tile(i, desc):
+        y = 100 + i * 120
+        return node("android.view.View", f"[0,{y}][320,{y + 110}]", clickable=True,
+                    children=node("android.view.View", f"[10,{y + 5}][310,{y + 105}]",
+                                  desc=html.escape(desc).replace("\n", "&#10;")))
+    return screen("".join(tile(i, d) for i, d in enumerate(cards)), pkg="com.android.vending")
+
+
+def test_a_store_tile_is_found_by_its_name_not_its_rating_or_size():
+    """The recording's Candy Crush id held "Star rating: 4.4" and "83 MB" and was graded strong."""
+    from mobilepilot.perception.locators import best, candidates
+
+    t = tree(_store("Candy Crush Saga\nPuzzle\nMatch 3\nCasual\nOffline\nStar rating: 4.4\n83 MB\n",
+                    "Candy Crush Soda Saga\nPuzzle\nCasual\nStar rating: 4.3\n90 MB\n"))
+    found = candidates(_el_at(t, 160, 150), t, "android")
+    pick = best(found)
+    assert pick.value == 'new UiSelector().descriptionStartsWith("Candy Crush Saga")' and pick.tier == "strong", pick
+    exact = next(c for c in found if c.strategy == "accessibility id")
+    assert exact.tier == "acceptable" and "lines" in exact.note
+    assert not any(".text" in c.value for c in found), found   # the label IS the description: no text attribute
+
+
+def test_a_name_shared_by_other_tiles_adds_its_second_line_as_a_real_newline():
+    """Search results for "yo": YouTube, YouTube Music and YouTube Kids all start with "YouTube"."""
+    from mobilepilot.perception.locators import best, candidates
+
+    yt = "YouTube\nGoogle LLC\nVideo Players & Editors\nEntertainment\nStreaming content\nInstalled\n"
+    t = tree(_store("YouTube Music\nGoogle LLC\nMusic & Audio\n", yt, "YouTube Kids\nGoogle LLC\nEntertainment\n"))
+    pick = best(candidates(_el_at(t, 160, 270), t, "android"))
+    assert pick.tier == "strong", pick
+    prefix = _appium_arg(pick.value)
+    assert prefix == "YouTube\nGoogle LLC"                      # a newline UiAutomator can match, not "\\n"
+    assert sum(1 for n in t.root.walk() if n.a11y_id and n.a11y_id.startswith(prefix)) == 1
+
+
+def test_a_name_too_short_to_stand_alone_takes_its_second_line():
+    """Live "yo" results (Pixel 7a): apps named "YO" and "Yo" got no stable locator at all."""
+    from mobilepilot.perception.locators import best, candidates
+
+    t = tree(_store("YoYo - Voice Chat Room, Ludo\nY Team\nContains ads\n", "YO\nMTN Bénin\nEvents\n23 MB\n",
+                    "Yo\nKidzia\nProductivity\n17 MB\n"))
+    assert _appium_arg(best(candidates(_el_at(t, 160, 270), t, "android")).value) == "YO\nMTN Bénin"
+    assert _appium_arg(best(candidates(_el_at(t, 160, 390), t, "android")).value) == "Yo\nKidzia"
+
+
+def test_a_prefix_is_unique_only_if_it_is_unique_ignoring_case():
+    """UiAutomator's descriptionStartsWith ignores case (Appium on the Pixel 7a, 2026-11-17: the
+    lowercased YouTube prefix still found the tile), so "Tube" also finds "tube player"."""
+    from mobilepilot.perception.locators import best, candidates
+
+    t = tree(_store("Tube\nAcme\nVideo\n", "tube player\nOther Co\nVideo\n"))
+    assert _appium_arg(best(candidates(_el_at(t, 160, 150), t, "android")).value) == "Tube\nAcme"
+
+
+def test_a_search_box_is_located_as_the_box_not_its_placeholder():
+    """Live Play Store: the empty EditText holds a TextView "Search Apps & Games". text() finds that
+    label, which cannot be typed into and is gone once something is typed."""
+    from mobilepilot.perception.locators import best, candidates
+    from mobilepilot.perception.snapshot import build_snapshot
+
+    t = tree(screen(node("EditText", "[148,129][932,255]", clickable=True, focused=True,
+                         children=node("TextView", "[148,160][574,223]", text="Search Apps &amp; Games")),
+                    pkg="com.android.vending"))
+    snap = build_snapshot(t, snapshot_id="s_p", mode="interactive", max_elements=1000)
+    field = next(el for el in snap.all_elements if el.role == "field")
+    assert best(candidates(field, t, "android")).value == 'new UiSelector().className("android.widget.EditText")'
+
+
+def test_a_recorded_play_store_flow_writes_locators_appium_can_use(tmp_path):
+    """The 2026-11-17 recording through the real Recorder: typing "yo" into the search box, then the
+    YouTube result. workflow.json held a null field locator and the YouTube id ending "Installed"."""
+    vending = "com.android.vending"
+
+    def search(typed):
+        inner = "" if typed else node("TextView", "[20,50][200,90]", text="Search Apps &amp; Games", pkg=vending)
+        return screen(node("EditText", "[10,40][310,100]", text=typed, clickable=True, focused=True, pkg=vending,
+                           children=inner) + node("Button", "[10,560][310,620]", text="Go", clickable=True, pkg=vending),
+                      pkg=vending)
+
+    yt = "YouTube\nGoogle LLC\nVideo Players & Editors\nEntertainment\nStreaming content\nInstalled\n"
+    r = Rig(tmp_path)
+    r.settle(search(""), 1.0, pkg=vending)
+    r.settle(search("yo"), 2.0, pkg=vending)
+    r.tap(160, 590, 3.0)
+    r.settle(_store("YouTube Music\nGoogle LLC\nMusic & Audio\n", yt, "YouTube Kids\nGoogle LLC\nKids\n"), 4.0,
+             pkg=vending)
+    r.tap(160, 270, 5.0)
+    r.stop()
+    steps = json.loads((r.rec.folder / "workflow.json").read_text())["steps"]
+    typed = next(s for s in steps if s["action"] == "type")
+    assert typed["data"] == "yo"
+    assert typed["target"]["locator"]["value"] == 'new UiSelector().className("android.widget.EditText")'
+    tile = steps[-1]["target"]["locator"]
+    assert tile["tier"] == "strong" and _appium_arg(tile["value"]) == "YouTube\nGoogle LLC", tile
+
+
+def test_a_quote_in_a_selector_survives_appiums_parser():
+    from mobilepilot.perception.locators import best, candidates
+
+    t = tree(_store('Say "Hi"\nChat app\n', "Other\nApp\n"))
+    pick = best(candidates(_el_at(t, 160, 150), t, "android"))
+    assert _appium_arg(pick.value) == 'Say "Hi"'
+
+
+def test_a_text_field_with_no_id_is_found_by_its_class_when_it_is_the_only_one():
+    """The recording's search field (step 7) had no content-desc or resource-id: locator null."""
+    from mobilepilot.perception.locators import best, candidates
+    from mobilepilot.perception.snapshot import build_snapshot
+
+    t = tree(screen(node("EditText", "[10,40][310,100]", text="yo", focused=True)
+                    + node("Button", "[10,200][310,260]", text="Clear", clickable=True), pkg="com.android.vending"))
+    snap = build_snapshot(t, snapshot_id="s_f", mode="interactive", max_elements=1000)
+    field = next(el for el in snap.all_elements if (el.extra.get("class") or "").endswith("EditText"))
+    pick = best(candidates(field, t, "android"))
+    assert pick is not None and pick.value == 'new UiSelector().className("android.widget.EditText")', pick
+    assert pick.tier == "fragile" and "yo" not in pick.value     # never the typed text
 
 
 def test_a_launcher_step_tells_the_test_to_start_the_app_by_package(tmp_path):
